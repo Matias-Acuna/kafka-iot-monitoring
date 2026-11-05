@@ -87,3 +87,36 @@ These contracts exclude temperature, thresholds, frequency counts, temperature d
 The contracts preserve event and run traceability, maintain the timestamps needed by the experimental design, and support the subsequent FD4 and FD5 implementation stages across all three rules.
 
 This is an approved implementation-level contract decision. It does not modify the official Phase D protocol or Chapter 4.
+
+## D.3.31 — Kafka Streams CLI Configuration
+
+- **Approval date:** 2026-11-05
+- **Status:** Approved by the project owner
+- **Component:** `services/kafka-streams`
+
+### Original approved design
+
+The official Phase D protocol originally specifies an `application.yml` file for the Kafka Streams service.
+
+### Approved implementation change
+
+The project owner explicitly approved replacing `application.yml` with command-line (CLI) configuration for this service. The Kafka Streams application will receive its runtime configuration through these planned parameters:
+
+- `--bootstrap-servers`
+- `--application-id`
+- `--rule`
+- `--temperature-threshold`
+
+Initially, only `HIGH_TEMPERATURE` will be supported as the active rule. `HIGH_FREQUENCY` and `RAPID_CHANGE` belong to the later D.5 implementation stage. The temperature threshold must remain configurable, not hardcoded.
+
+The existing `StreamsConfig.createProperties()` method will be reused for Kafka Streams baseline properties. The CLI implementation is still pending and will be developed in subsequent steps.
+
+### Technical rationale
+
+This decision avoids an additional YAML parser and unnecessary duplicate configuration mechanisms. The approach remains consistent with the previously approved CLI configuration of the Sensor Producer.
+
+### Scope and traceability
+
+This decision applies only to the Kafka Streams service. It does not change the existing Sensor Producer configuration decision or automatically change the future Measurement Consumer configuration.
+
+This is an explicitly approved implementation adaptation. It does not modify the official Phase D protocol or Chapter 4.
