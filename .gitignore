@@ -1,1 +1,4 @@
 target/
+
+# Generated functional-test CSV results only
+/experiments/results/functional-test-*.csv
