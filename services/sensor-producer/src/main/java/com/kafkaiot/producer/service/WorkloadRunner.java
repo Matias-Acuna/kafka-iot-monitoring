@@ -49,6 +49,25 @@ public final class WorkloadRunner {
     private final double intervalNanos;
     private final long warmUpNanos;
     private final long totalNanos;
+    private volatile Timing timing;
+
+    /** Latest immutable invocation snapshot; null before the first validated run starts. */
+    public Timing getTiming() {
+        return timing;
+    }
+
+    /** Local nanoseconds are process-specific; boundaries are offsets from workloadStartNs. */
+    public record Timing(long workloadStartNs, long workloadStartEpochMs, long sampleSpanNs,
+                         long warmUpDurationNs, long measurementDurationNs,
+                         Long generationStoppedElapsedNs, Long generationStoppedEpochMs) {
+        public long measurementStartOffsetNs() {
+            return warmUpDurationNs;
+        }
+
+        public long measurementDeadlineOffsetNs() {
+            return warmUpDurationNs + measurementDurationNs;
+        }
+    }
 
     public WorkloadRunner(SensorEventGenerator generator,
                           SensorEventPublisher publisher,
@@ -112,9 +131,14 @@ public final class WorkloadRunner {
                     ProducerEventCsvWriter writer) throws InterruptedException {
         Objects.requireNonNull(beforePublish, "beforePublish");
         Objects.requireNonNull(completionCallback, "completionCallback");
-        long start = System.nanoTime();
+        long n0 = System.nanoTime();
+        long epochMs = System.currentTimeMillis();
+        long n1 = System.nanoTime();
+        long start = n0;
         double nextDueNanos = 0;
         try {
+            timing = new Timing(n0, epochMs, n1 - n0, warmUpNanos, totalNanos - warmUpNanos,
+                    null, null);
             while (true) {
                 if (Thread.currentThread().isInterrupted()) {
                     throw new InterruptedException("Workload interrupted");
@@ -161,6 +185,11 @@ public final class WorkloadRunner {
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw exception;
+        } finally {
+            long stoppedNs = System.nanoTime();
+            long stoppedEpochMs = System.currentTimeMillis();
+            timing = new Timing(n0, epochMs, n1 - n0, warmUpNanos, totalNanos - warmUpNanos,
+                    stoppedNs - n0, stoppedEpochMs);
         }
     }
 }

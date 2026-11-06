@@ -1,16 +1,21 @@
 package com.kafkaiot.producer;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kafkaiot.producer.config.ProducerKafkaConfig;
 import com.kafkaiot.producer.generation.SensorEventGenerator;
 import com.kafkaiot.producer.io.ProducerCsvWriter;
 import com.kafkaiot.producer.io.ProducerEventCsvWriter;
+import com.kafkaiot.producer.io.RunMetadataWriter;
 import com.kafkaiot.producer.metrics.ProducerMetrics;
 import com.kafkaiot.producer.metrics.ProducerMetrics.PhaseSnapshot;
 import com.kafkaiot.producer.service.SensorEventPublisher;
 import com.kafkaiot.producer.service.WorkloadRunner;
 import org.apache.kafka.clients.producer.ProducerConfig;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -24,7 +29,7 @@ public final class SensorProducerApplication {
     private static final Set<String> OPTIONS = Set.of(
             "bootstrap-servers", "run-id", "random-seed", "initial-event-timestamp",
             "timestamp-increment", "target-events-per-second", "warm-up-seconds",
-            "measurement-seconds", "csv-output", "acks", "enable-idempotence", "event-csv-output");
+            "measurement-seconds", "csv-output", "acks", "enable-idempotence", "event-csv-output", "run-config-output");
 
     private SensorProducerApplication() {
     }
@@ -42,6 +47,7 @@ public final class SensorProducerApplication {
                       --target-events-per-second DOUBLE (finite and positive)
                       --csv-output PATH
                     Optional:
+                      --run-config-output PATH    (e.g. experiments/results/<runId>/run-config.json)
                       --event-csv-output PATH     (new file; e.g. experiments/results/<runId>/producer-events.csv)
                       --warm-up-seconds LONG      (default from WorkloadRunner: 60)
                       --measurement-seconds LONG  (default from WorkloadRunner: 300)
@@ -117,58 +123,297 @@ public final class SensorProducerApplication {
 
         ProducerMetrics metrics = new ProducerMetrics(runId);
         SensorEventGenerator generator = new SensorEventGenerator(runId, seed, initialTimestamp, increment);
-        Exception executionFailure = null;
-        boolean interrupted = false;
-        try (ProducerEventCsvWriter eventWriter = openEventWriter(options, csvOutput);
-             SensorEventPublisher publisher = publisherFactory.create(bootstrap, acks, enableIdempotence)) {
-            WorkloadRunner runner = new WorkloadRunner(generator, publisher, rate, warmUp, measurement);
+        try (Metadata metadata = openMetadata(options, csvOutput, runId, seed, initialTimestamp,
+                increment, rate, warmUp, measurement,
+                ProducerKafkaConfig.createProperties(bootstrap, acks, enableIdempotence))) {
             try {
-                runner.run((phase, event) -> metrics.recordAttempt(phase),
-                        (phase, event, metadata, exception) -> {
-                            // WorkloadRunner guards each event's outcome against duplicates.
-                            if (exception == null) {
-                                metrics.recordConfirmation(phase);
-                            } else {
-                                metrics.recordFailure(phase, exception.toString());
+                Exception executionFailure = null;
+                boolean interrupted = false;
+                try {
+                    stage(metadata, "EVENT_CSV_OPEN");
+                    ProducerEventCsvWriter eventWriter = openEventWriter(options, csvOutput);
+                    try (Closeable eventCleanup = () -> {
+                        if (eventWriter != null) {
+                            try {
+                                eventWriter.close();
+                            } catch (IOException exception) {
+                                if (metadata != null) {
+                                    metadata.addFailure("EVENT_CSV_CLOSE", exception);
+                                }
+                                throw exception;
                             }
-                        }, eventWriter);
-            } catch (InterruptedException exception) {
-                interrupted = true;
-                // Allow resource closure to await callbacks; restore status below.
-                Thread.interrupted();
+                            observe(metadata, "eventCsvClosedEpochMs", "EVENT_CSV_CLOSED");
+                        }
+                    }) {
+                        stage(metadata, "PUBLISHER_STARTUP");
+                        SensorEventPublisher publisher = publisherFactory.create(bootstrap, acks, enableIdempotence);
+                        try (Closeable publisherCleanup = () -> {
+                            try {
+                                publisher.close();
+                            } catch (RuntimeException exception) {
+                                if (metadata != null) {
+                                    metadata.addFailure("PUBLISHER_CLOSE", exception);
+                                }
+                                throw exception;
+                            }
+                            observe(metadata, "publicationsDrainedEpochMs", "PUBLICATIONS_DRAINED");
+                        }) {
+                            WorkloadRunner runner = new WorkloadRunner(generator, publisher, rate, warmUp, measurement);
+                            Throwable workloadFailure = null;
+                            stage(metadata, "WORKLOAD");
+                            try {
+                                runner.run((phase, event) -> metrics.recordAttempt(phase),
+                                        (phase, event, recordMetadata, exception) -> {
+                                            // WorkloadRunner guards each event's outcome against duplicates.
+                                            if (exception == null) {
+                                                metrics.recordConfirmation(phase);
+                                            } else {
+                                                metrics.recordFailure(phase, exception.toString());
+                                            }
+                                        }, eventWriter);
+                            } catch (InterruptedException exception) {
+                                interrupted = true;
+                                // Allow resource closure to await callbacks; restore status below.
+                                Thread.interrupted();
+                                workloadFailure = exception;
+                                throw exception;
+                            } catch (RuntimeException | Error exception) {
+                                workloadFailure = exception;
+                                throw exception;
+                            } finally {
+                                if (metadata != null) {
+                                    try {
+                                        metadata.timing(runner.getTiming());
+                                    } catch (IOException timingFailure) {
+                                        if (workloadFailure == null) {
+                                            throw timingFailure;
+                                        }
+                                        workloadFailure.addSuppressed(timingFailure);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception exception) {
+                    executionFailure = exception;
+                } finally {
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                // Successful producer close waits for pending sends and their callbacks.
+                // A failed close prevents export even if counters happen to match.
+                ProducerMetrics.Snapshot snapshot = metrics.snapshot();
+                if (metadata != null) {
+                    for (PhaseSnapshot phase : new PhaseSnapshot[]{snapshot.warmUp(), snapshot.measurement()}) {
+                        if (phase.failed() != 0) {
+                            metadata.data.withArray("failures").addObject().put("category", "PUBLICATION")
+                                    .put("phase", phase.phase().name()).put("count", phase.failed())
+                                    .put("latestError", phase.latestError());
+                        }
+                    }
+                }
+                System.out.printf(Locale.ROOT, "runId=%s targetEventsPerSecond=%s%n", runId, rate);
+                boolean consistent = report(snapshot.warmUp()) & report(snapshot.measurement());
+                if (executionFailure != null) {
+                    System.err.println("No final CSV exported: workload, producer closure, or event CSV output failed.");
+                    if (options.containsKey("event-csv-output")) {
+                        System.err.println("Execution incomplete; any observations written for this execution are partial.");
+                    }
+                    throw executionFailure;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("No final CSV exported: execution was interrupted");
+                }
+                if (!consistent) {
+                    throw new IllegalStateException("No final CSV exported: unmatched publication accounting");
+                }
+                stage(metadata, "TOTALS_CSV");
+                ProducerCsvWriter.write(csvOutput, snapshot);
+                System.out.println("Final CSV exported: " + csvOutput);
+                if (snapshot.warmUp().failed() != 0 || snapshot.measurement().failed() != 0) {
+                    stage(metadata, "PUBLICATION_FAILURE");
+                    throw new IllegalStateException(
+                            "Workload completed with publication failures; final CSV contains those failures");
+                }
+                if (metadata != null) {
+                    metadata.data.withObject("components").put("producer", "COMPLETED");
+                    metadata.observe("producerCleanupCompletedEpochMs", "COMPLETED");
+                }
+            } catch (Exception | Error exception) {
+                if (metadata != null) {
+                    boolean restoreInterrupt = Thread.interrupted();
+                    try {
+                        metadata.failed(exception);
+                    } catch (IOException recordingFailure) {
+                        exception.addSuppressed(recordingFailure);
+                    } finally {
+                        if (restoreInterrupt) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
                 throw exception;
             }
-        } catch (Exception exception) {
-            executionFailure = exception;
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void stage(Metadata metadata, String stage) {
+        if (metadata != null) {
+            metadata.stage = stage;
+        }
+    }
+
+    private static void observe(Metadata metadata, String name, String state) throws IOException {
+        if (metadata != null) {
+            metadata.observe(name, state);
+        }
+    }
+
+    private static Metadata openMetadata(Map<String, String> options, Path csvOutput, String runId,
+                                         long seed, long initialTimestamp, long increment, double rate,
+                                         long warmUp, long measurement, Properties settings) throws IOException {
+        if (!options.containsKey("run-config-output")) {
+            return null;
+        }
+        String value = required(options, "run-config-output");
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("--run-config-output requires a usable file path");
+        }
+        Path output = Path.of(value);
+        Path lock = output.resolveSibling(output.getFileName() + ".lock");
+        for (Path reserved : new Path[]{output, lock}) {
+            rejectAlias(reserved, csvOutput);
+            if (options.containsKey("event-csv-output")) {
+                rejectAlias(reserved, Path.of(required(options, "event-csv-output")));
+            }
+        }
+        try {
+            return new Metadata(output, runId, options, seed, initialTimestamp, increment,
+                    rate, warmUp, measurement, settings);
+        } catch (IOException exception) {
+            throw new MetadataFailure(exception);
+        }
+    }
+
+    private static void rejectAlias(Path metadata, Path csv) throws IOException {
+        if (resolvedOutputPath(metadata).equals(resolvedOutputPath(csv))
+                || (Files.exists(metadata) && Files.exists(csv) && Files.isSameFile(metadata, csv))) {
+            throw new IllegalArgumentException("Run metadata, its lock, and CSV outputs must be different files");
+        }
+    }
+
+    /** Application-owned snapshots; never invoked from publication callbacks. */
+    private static final class Metadata implements Closeable {
+        private static final ObjectMapper JSON = new ObjectMapper();
+        private final RunMetadataWriter writer;
+        private final ObjectNode data;
+        private String stage = "BEFORE_WORKLOAD";
+
+        private Metadata(Path output, String runId, Map<String, String> options, long seed,
+                         long initialTimestamp, long increment, double rate, long warmUp,
+                         long measurement, Properties settings) throws IOException {
+            writer = new RunMetadataWriter(output, runId);
+            try {
+                data = (ObjectNode) JSON.readTree(Files.readAllBytes(output));
+                ObjectNode configuration = data.putObject("configuration");
+                ObjectNode producer = configuration.putObject("producer");
+                producer.put("runId", runId).put("randomSeed", seed)
+                        .put("initialEventTimestamp", initialTimestamp).put("timestampIncrementMs", increment)
+                        .put("targetEventsPerSecond", rate).put("csvOutput", options.get("csv-output"))
+                        .put("eventCsvOutput", options.get("event-csv-output"))
+                        .put("runConfigOutput", output.toString());
+                ObjectNode kafka = producer.putObject("kafkaSettings");
+                settings.stringPropertyNames().forEach(key -> kafka.put(key, settings.getProperty(key)));
+                configuration.putNull("streams");
+                configuration.putNull("consumer");
+                data.putObject("phaseDurationsMs").put("warmUp", Math.multiplyExact(warmUp, 1000L))
+                        .put("measurement", Math.multiplyExact(measurement, 1000L)).putNull("maximumDrain");
+                data.putNull("clockAnchors");
+                data.putNull("scheduled");
+                data.putObject("observed").putNull("generationStoppedElapsedNs")
+                        .putNull("generationStoppedEpochMs").putNull("publicationsDrainedEpochMs")
+                        .putNull("eventCsvClosedEpochMs").putNull("producerCleanupCompletedEpochMs")
+                        .putNull("drainEndedEpochMs");
+                data.withObject("components").put("producer", "RUNNING");
+                data.put("experimentStatus", "NOT_FINALIZED");
+                observe("beforeWorkloadEpochMs", "BEFORE_WORKLOAD");
+            } catch (IOException | RuntimeException exception) {
+                try {
+                    writer.close();
+                } catch (IOException cleanup) {
+                    exception.addSuppressed(cleanup);
+                }
+                throw exception;
             }
         }
 
-        // Successful producer close waits for pending sends and their callbacks.
-        // A failed close prevents export even if counters happen to match.
-        ProducerMetrics.Snapshot snapshot = metrics.snapshot();
-        System.out.printf(Locale.ROOT, "runId=%s targetEventsPerSecond=%s%n", runId, rate);
-        boolean consistent = report(snapshot.warmUp()) & report(snapshot.measurement());
-        if (executionFailure != null) {
-            System.err.println("No final CSV exported: workload, producer closure, or event CSV output failed.");
-            if (options.containsKey("event-csv-output")) {
-                System.err.println("Execution incomplete; any observations written for this execution are partial.");
+        private void timing(WorkloadRunner.Timing timing) throws IOException {
+            if (timing != null) {
+                data.putObject("clockAnchors").put("workloadStartNs", timing.workloadStartNs())
+                        .put("workloadStartEpochMs", timing.workloadStartEpochMs())
+                        .put("sampleSpanNs", timing.sampleSpanNs());
+                data.withObject("phaseDurationsMs").put("warmUpDurationNs", timing.warmUpDurationNs())
+                        .put("measurementDurationNs", timing.measurementDurationNs());
+                data.putObject("scheduled").put("measurementStartOffsetNs", timing.measurementStartOffsetNs())
+                        .put("measurementDeadlineOffsetNs", timing.measurementDeadlineOffsetNs())
+                        .put("measurementStartEpochMs", Math.addExact(timing.workloadStartEpochMs(),
+                                timing.measurementStartOffsetNs() / 1_000_000L))
+                        .put("measurementDeadlineEpochMs", Math.addExact(timing.workloadStartEpochMs(),
+                                timing.measurementDeadlineOffsetNs() / 1_000_000L))
+                        .put("epochAlignment", "DERIVED_FROM_BRACKETED_CLOCK_SAMPLE");
+                data.withObject("observed").put("generationStoppedElapsedNs", timing.generationStoppedElapsedNs())
+                        .put("generationStoppedEpochMs", timing.generationStoppedEpochMs());
             }
-            throw executionFailure;
+            observe("generationSnapshotRecordedEpochMs", "GENERATION_TERMINATED");
         }
-        if (Thread.currentThread().isInterrupted()) {
-            throw new InterruptedException("No final CSV exported: execution was interrupted");
+
+        private void observe(String name, String state) throws IOException {
+            data.withObject("observed").put(name, System.currentTimeMillis());
+            data.withObject("components").put("producerLifecycle", state);
+            persist();
         }
-        if (!consistent) {
-            throw new IllegalStateException("No final CSV exported: unmatched publication accounting");
+
+        private void failed(Throwable failure) throws IOException {
+            data.withObject("components").put("producer",
+                    failure instanceof InterruptedException ? "INTERRUPTED" : "FAILED");
+            addFailure(stage, failure);
+            observe("failureObservedEpochMs", "INCOMPLETE");
         }
-        ProducerCsvWriter.write(csvOutput, snapshot);
-        System.out.println("Final CSV exported: " + csvOutput);
-        if (snapshot.warmUp().failed() != 0 || snapshot.measurement().failed() != 0) {
-            throw new IllegalStateException(
-                    "Workload completed with publication failures; final CSV contains those failures");
+
+        private void addFailure(String stage, Throwable failure) {
+            ObjectNode entry = data.withArray("failures").addObject();
+            entry.put("stage", stage).put("type", failure.getClass().getName()).put("message", failure.getMessage());
+            entry.put("category", failure instanceof MetadataFailure ? "METADATA"
+                    : failure instanceof InterruptedException ? "INTERRUPTION"
+                    : failure instanceof UncheckedIOException
+                    && "PUBLISHER_CLOSE".equals(stage)
+                    && failure.getMessage() != null
+                    && failure.getMessage().startsWith("Producer observation CSV write failed")
+                    ? "EVENT_CSV" : stage);
+            for (Throwable suppressed : failure.getSuppressed()) {
+                entry.withArray("suppressed").add(suppressed.toString());
+            }
+        }
+
+        private void persist() throws IOException {
+            try {
+                writer.write(data);
+            } catch (IOException exception) {
+                throw new MetadataFailure(exception);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            writer.close();
+        }
+    }
+
+    private static final class MetadataFailure extends IOException {
+        private MetadataFailure(IOException cause) {
+            super("Run metadata persistence failed; execution incomplete", cause);
         }
     }
 

@@ -249,3 +249,72 @@ B4 retains its special experimental procedure and provisional recovery criteria 
 ### Scope and traceability
 
 This decision records implementation details formally approved by the project owner for FD6. It does not replace or modify the official Phase D protocol or the methodology in Chapter 4. All previous implementation decisions remain unchanged.
+
+## D.6.42 — Experimental Throughput Policy
+
+- **Status:** FORMALLY APPROVED
+- **Component:** FD6 experimental throughput measurement
+
+### Approved policy
+
+For ordinary B1–B3 experiments, primary measurement throughput includes only observations satisfying both conditions:
+
+- The original event belongs to `MEASUREMENT`.
+- The corresponding observation timestamp falls inside the fixed 300-second measurement interval.
+
+Measure attempted input, confirmed input, and unique result throughput separately. Deduplicate unique results by `(runId, eventId)`. Use actual observation timestamps and one-second bins, including zero-count bins.
+
+Warm-up events confirmed during measurement do not contribute to primary measurement throughput. Measurement events confirmed or received during drain do not contribute to measurement throughput. Preserve late observations for latency, reliability, and reconciliation analysis; never move their timestamps backward or reassign them to measurement throughput.
+
+### Scope and traceability
+
+This formally approved measurement policy preserves the existing Chapter 4 methodology and official Phase D protocol. It does not replace the separate B4 failure/recovery methodology.
+
+## D.6.43 — Run Metadata Ownership
+
+- **Status:** FORMALLY APPROVED
+- **Component:** Experimental run metadata
+
+### Approved ownership
+
+Use one metadata file per `runId` at `experiments/results/<runId>/run-config.json`. The Sensor Producer creates and updates its own metadata through the optional `--run-config-output <path>` argument. The experimental coordinator assumes ownership only after the Producer finishes and releases ownership.
+
+Never allow simultaneous writers or overwrite metadata belonging to another `runId`. Incomplete experiments remain explicitly `NOT_FINALIZED` until properly finalized. Producer completion does not imply completion of the entire experiment.
+
+Store actual configuration and timing information; unavailable values remain explicitly unknown.
+
+### Scope and traceability
+
+This formally approved ownership decision governs metadata persistence and handoff. It does not change Chapter 4 or the official Phase D protocol.
+
+## D.6.44 — Clock Handling Convention
+
+- **Status:** ACCEPTED TECHNICAL IMPLEMENTATION CONVENTION
+- **Component:** Experimental timing observations
+
+### Accepted convention
+
+Use `System.nanoTime()` for local elapsed timing and phase scheduling. Use `System.currentTimeMillis()` for epoch timestamps of recorded observations.
+
+Capture closely associated clock readings at workload start:
+
+```java
+long n0 = System.nanoTime();
+long epochMs = System.currentTimeMillis();
+long n1 = System.nanoTime();
+long sampleSpanNs = n1 - n0;
+```
+
+The association and `sampleSpanNs` qualify epoch alignment; they do not establish perfectly exact alignment. Do not compare `nanoTime()` values across independent JVMs. Preserve original timestamps and flag relevant clock inconsistencies rather than silently correcting them. Do not add synchronization infrastructure.
+
+### Scope and traceability
+
+This is a technical implementation convention, not an additional Chapter 4 methodological requirement. The approved experimental methodology and official Phase D protocol remain unchanged.
+
+### Implementation status — D.6.45–D.6.47
+
+- **D.6.45:** `RunMetadataWriter` implemented and tested.
+- **D.6.46:** `WorkloadRunner` timing snapshots implemented.
+- **D.6.47:** Optional Producer `--run-config-output` integration implemented and unit-tested.
+
+These components do not yet constitute a fully finalized experimental measurement pipeline. Real-Kafka metadata integration has not yet been verified.

@@ -20,11 +20,15 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -217,6 +221,141 @@ class WorkloadRunnerTest {
         } finally {
             assertThrows(UncheckedIOException.class, publisher::close);
             writer.close();
+        }
+    }
+
+    @Test
+    void exposesAnchorAndConfiguredBoundariesDuringRun() {
+        var kafka = mock(true);
+        RuntimeException stop = new RuntimeException("stop before publication");
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = new WorkloadRunner(
+                    new SensorEventGenerator("run-1", 123, 0, 1), publisher, 10, 60, 300);
+            assertNull(runner.getTiming());
+            long before = System.nanoTime();
+            assertSame(stop, assertThrows(RuntimeException.class, () -> runner.run((phase, event) -> {
+                WorkloadRunner.Timing timing = runner.getTiming();
+                assertNotNull(timing);
+                assertTrue(timing.workloadStartNs() - before >= 0);
+                assertTrue(System.nanoTime() - timing.workloadStartNs() >= timing.sampleSpanNs());
+                assertTrue(timing.sampleSpanNs() >= 0);
+                assertTrue(timing.workloadStartEpochMs() > 0);
+                assertEquals(TimeUnit.SECONDS.toNanos(60), timing.warmUpDurationNs());
+                assertEquals(TimeUnit.SECONDS.toNanos(300), timing.measurementDurationNs());
+                assertEquals(TimeUnit.SECONDS.toNanos(60), timing.measurementStartOffsetNs());
+                assertEquals(TimeUnit.SECONDS.toNanos(360), timing.measurementDeadlineOffsetNs());
+                assertNull(timing.generationStoppedElapsedNs());
+                assertNull(timing.generationStoppedEpochMs());
+                assertEquals(Phase.WARM_UP, phase);
+                throw stop;
+            }, (phase, event, metadata, exception) -> { })));
+            assertTrue(kafka.history().isEmpty());
+            assertTrue(runner.getTiming().generationStoppedElapsedNs()
+                    < runner.getTiming().measurementDeadlineOffsetNs());
+        }
+    }
+
+    @Test
+    void zeroWarmUpAndNormalTerminationRetainFixedDeadline() throws InterruptedException {
+        var kafka = mock(true);
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = new WorkloadRunner(
+                    new SensorEventGenerator("run-1", 123, 0, 1), publisher, 10, 0, 1);
+            runner.run((phase, event, metadata, exception) -> assertEquals(Phase.MEASUREMENT, phase));
+            WorkloadRunner.Timing timing = runner.getTiming();
+            assertEquals(0, timing.warmUpDurationNs());
+            assertEquals(0, timing.measurementStartOffsetNs());
+            assertEquals(TimeUnit.SECONDS.toNanos(1), timing.measurementDurationNs());
+            assertEquals(TimeUnit.SECONDS.toNanos(1), timing.measurementDeadlineOffsetNs());
+            assertNotNull(timing.generationStoppedEpochMs());
+            assertTrue(timing.generationStoppedElapsedNs() >= timing.measurementDeadlineOffsetNs());
+            assertTrue(System.nanoTime() - timing.workloadStartNs() >= timing.generationStoppedElapsedNs());
+        }
+    }
+
+    @Test
+    void synchronousSendFailureRetainsExceptionAndTerminationTiming() {
+        var kafka = mock(false);
+        var failure = new IllegalStateException("send rejected");
+        kafka.sendException = failure;
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = runner(publisher, 0);
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> runner.run((phase, event, metadata, exception) -> assertSame(failure, exception))));
+            assertNotNull(runner.getTiming().generationStoppedEpochMs());
+            assertTrue(runner.getTiming().generationStoppedElapsedNs() >= runner.getTiming().sampleSpanNs());
+        }
+    }
+
+    @Test
+    void interruptionRetainsStatusAndTerminationTiming() {
+        var kafka = mock(false);
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = runner(publisher, 0);
+            Thread.currentThread().interrupt();
+            try {
+                assertThrows(InterruptedException.class,
+                        () -> runner.run((phase, event, metadata, exception) -> { }));
+                assertTrue(Thread.currentThread().isInterrupted());
+                assertNotNull(runner.getTiming().generationStoppedElapsedNs());
+                assertNotNull(runner.getTiming().generationStoppedEpochMs());
+                assertTrue(kafka.history().isEmpty());
+            } finally {
+                Thread.interrupted();
+            }
+        }
+    }
+
+    @Test
+    void snapshotsRemainImmutableAndSequentialRunsReplacePreviousTiming() {
+        var kafka = mock(true);
+        RuntimeException stop = new RuntimeException("stop");
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = runner(publisher, 0);
+            WorkloadRunner.BeforePublishCallback beforePublish = (phase, event) -> { throw stop; };
+            assertSame(stop, assertThrows(RuntimeException.class,
+                    () -> runner.run(beforePublish, (phase, event, metadata, exception) -> { })));
+            WorkloadRunner.Timing first = runner.getTiming();
+            assertSame(stop, assertThrows(RuntimeException.class,
+                    () -> runner.run(beforePublish, (phase, event, metadata, exception) -> { })));
+            assertTrue(runner.getTiming().workloadStartNs() - first.workloadStartNs()
+                    >= first.generationStoppedElapsedNs());
+            assertNotNull(first.generationStoppedEpochMs());
+        }
+    }
+
+    @Test
+    void delayedPublicationSkipsMissedSlotsWithoutCatchUpBurst() {
+        long intervalNs = TimeUnit.MILLISECONDS.toNanos(100);
+        long[] firstReturnNs = new long[1];
+        AtomicInteger sends = new AtomicInteger();
+        var kafka = new MockProducer<String, String>() {
+            @Override
+            public synchronized Future<RecordMetadata> send(ProducerRecord<String, String> record, Callback callback) {
+                if (sends.getAndIncrement() == 0) {
+                    long delayStart = System.nanoTime();
+                    long delayNs = TimeUnit.MILLISECONDS.toNanos(250);
+                    while (System.nanoTime() - delayStart < delayNs) {
+                        LockSupport.parkNanos(delayNs - (System.nanoTime() - delayStart));
+                    }
+                    firstReturnNs[0] = System.nanoTime();
+                }
+                return CompletableFuture.completedFuture(null);
+            }
+        };
+        RuntimeException stop = new RuntimeException("stop before second publication");
+        AtomicInteger attempts = new AtomicInteger();
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            WorkloadRunner runner = new WorkloadRunner(
+                    new SensorEventGenerator("run-1", 123, 0, 1), publisher, 10, 0, 10);
+            assertSame(stop, assertThrows(RuntimeException.class, () -> runner.run((phase, event) -> {
+                if (attempts.getAndIncrement() == 1) {
+                    assertTrue(System.nanoTime() - firstReturnNs[0] >= intervalNs);
+                    throw stop;
+                }
+            }, (phase, event, metadata, exception) -> { })));
+            assertEquals(1, sends.get());
+            assertEquals(2, attempts.get());
         }
     }
 
