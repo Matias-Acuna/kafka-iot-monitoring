@@ -7,6 +7,7 @@ import com.kafkaiot.streams.model.SensorEvent;
 import com.kafkaiot.streams.model.SensorResult;
 import com.kafkaiot.streams.rules.HighTemperatureRule;
 import com.kafkaiot.streams.rules.HighFrequencyProcessor;
+import com.kafkaiot.streams.rules.RapidChangeProcessor;
 import com.kafkaiot.streams.state.StateStoreDefinitions;
 import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.serialization.Serdes;
@@ -72,6 +73,35 @@ public final class SensorTopology {
         KStream<String, String> resultJson = input.process(
                 () -> new HighFrequencyProcessor(windowDurationMs, countThreshold),
                 StateStoreDefinitions.HIGH_FREQUENCY_STORE);
+        resultJson.to("sensor-results", Produced.with(Serdes.String(), Serdes.String()));
+
+        KStream<String, SensorResult> results = resultJson.mapValues(json -> {
+            try {
+                return OBJECT_MAPPER.readValue(json, SensorResult.class);
+            } catch (JsonProcessingException exception) {
+                throw new SerializationException("Failed to deserialize SensorResult", exception);
+            }
+        });
+        publishAlerts(results);
+        return builder.build();
+    }
+
+    /** Builds stateful RAPID_CHANGE processing for events keyed by deviceId. */
+    public static Topology buildRapidChange(long maxTimeDifferenceMs, double temperatureChangeThreshold) {
+        if (maxTimeDifferenceMs <= 0) {
+            throw new IllegalArgumentException("maxTimeDifferenceMs must be positive");
+        }
+        if (!Double.isFinite(temperatureChangeThreshold) || temperatureChangeThreshold <= 0) {
+            throw new IllegalArgumentException("temperatureChangeThreshold must be finite and positive");
+        }
+
+        StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(StateStoreDefinitions.rapidChangeStoreBuilder());
+        KStream<String, String> input = builder.stream("sensor-events",
+                Consumed.with(Serdes.String(), Serdes.String()));
+        KStream<String, String> resultJson = input.process(
+                () -> new RapidChangeProcessor(maxTimeDifferenceMs, temperatureChangeThreshold),
+                StateStoreDefinitions.RAPID_CHANGE_STORE);
         resultJson.to("sensor-results", Produced.with(Serdes.String(), Serdes.String()));
 
         KStream<String, SensorResult> results = resultJson.mapValues(json -> {

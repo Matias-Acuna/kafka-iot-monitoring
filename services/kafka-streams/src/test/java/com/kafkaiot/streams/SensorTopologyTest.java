@@ -31,6 +31,7 @@ class SensorTopologyTest {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final long HIGH_FREQUENCY_START = 1_700_000_000_000L;
     private static final long HIGH_FREQUENCY_WINDOW_MS = 1_000L;
+    private static final long RAPID_CHANGE_START = 1_700_000_000_000L;
 
     @TempDir
     Path tempDir;
@@ -254,6 +255,143 @@ class SensorTopologyTest {
             }
             assertTrue(results.isEmpty());
             assertTrue(alerts.isEmpty());
+        }
+    }
+
+    @Test
+    void rapidChangePublishesExactResultsAndAlertsUsingImmediatePredecessor()
+            throws JsonProcessingException {
+        SensorEvent[] events = {
+                rapidChangeEvent("event-\"1", "run-1", "device-1", 0, 20),
+                rapidChangeEvent("event-2", "run-1", "device-1", 10, 30),
+                rapidChangeEvent("event-3", "run-1", "device-1", 20, 34),
+                rapidChangeEvent("event-4", "run-1", "device-1", 30, 38),
+                rapidChangeEvent("event-5", "run-1", "device-1", 40, 44)
+        };
+        try (TopologyTestDriver driver = newRapidChangeDriver()) {
+            assertRapidChangeOutputs(driver, events, new boolean[]{false, true, false, false, true}, null);
+            KeyValueStore<String, String> state = driver.getKeyValueStore(StateStoreDefinitions.RAPID_CHANGE_STORE);
+            assertTrue(state.persistent());
+            assertEquals((RAPID_CHANGE_START + 40) + ":44.0", state.get("5:run-1device-1"));
+        }
+    }
+
+    @Test
+    void rapidChangeAppliesInclusiveTimeAndStrictTemperatureBoundariesToAlerts()
+            throws JsonProcessingException {
+        SensorEvent[] events = {
+                rapidChangeEvent("event-1", "run-1", "device-1", 0, 20),
+                rapidChangeEvent("event-2", "run-1", "device-1", 100, 25),
+                rapidChangeEvent("event-3", "run-1", "device-1", 200, 19),
+                rapidChangeEvent("event-4", "run-1", "device-1", 301, 40),
+                rapidChangeEvent("event-5", "run-1", "device-1", 302, 44)
+        };
+        try (TopologyTestDriver driver = newRapidChangeDriver()) {
+            assertRapidChangeOutputs(driver, events, new boolean[]{false, false, true, false, false}, null);
+        }
+    }
+
+    @Test
+    void rapidChangeKeepsDeviceStateAndAlertsIndependent() throws JsonProcessingException {
+        SensorEvent[] events = {
+                rapidChangeEvent("event-1", "run-1", "device-1", 0, 20),
+                rapidChangeEvent("event-2", "run-1", "device-2", 10, 100),
+                rapidChangeEvent("event-3", "run-1", "device-1", 20, 24),
+                rapidChangeEvent("event-4", "run-1", "device-2", 30, 110)
+        };
+        try (TopologyTestDriver driver = newRapidChangeDriver()) {
+            assertRapidChangeOutputs(driver, events, new boolean[]{false, false, false, true}, null);
+        }
+    }
+
+    @Test
+    void rapidChangeKeepsRunStateAndAlertsIndependentForSameDevice() throws JsonProcessingException {
+        SensorEvent[] events = {
+                rapidChangeEvent("event-1", "run-1", "device-1", 0, 20),
+                rapidChangeEvent("event-2", "run-2", "device-1", 10, 100),
+                rapidChangeEvent("event-3", "run-1", "device-1", 20, 24),
+                rapidChangeEvent("event-4", "run-2", "device-1", 30, 110)
+        };
+        try (TopologyTestDriver driver = newRapidChangeDriver()) {
+            assertRapidChangeOutputs(driver, events, new boolean[]{false, false, false, true}, null);
+        }
+    }
+
+    @Test
+    void rapidChangeUsesPayloadTimeDespiteDifferentKafkaTimestamps() throws JsonProcessingException {
+        SensorEvent[] events = {
+                rapidChangeEvent("event-1", "run-1", "device-1", 0, 20),
+                rapidChangeEvent("event-2", "run-1", "device-1", 10, 30),
+                rapidChangeEvent("event-3", "run-1", "device-1", 111, 50)
+        };
+        long[] kafkaTimestamps = {
+                RAPID_CHANGE_START, RAPID_CHANGE_START + 10_000, RAPID_CHANGE_START + 10_001
+        };
+        try (TopologyTestDriver driver = newRapidChangeDriver()) {
+            assertRapidChangeOutputs(driver, events, new boolean[]{false, true, false}, kafkaTimestamps);
+        }
+    }
+
+    @Test
+    void rapidChangeTopologyRejectsNonPositiveTimeLimits() {
+        for (long value : new long[]{0, -1, Long.MIN_VALUE}) {
+            assertThrows(IllegalArgumentException.class, () -> SensorTopology.buildRapidChange(value, 5.0));
+        }
+    }
+
+    @Test
+    void rapidChangeTopologyRejectsNonPositiveOrNonfiniteTemperatureThresholds() {
+        for (double value : new double[]{0, -0.0, -1, Double.NaN,
+                Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY}) {
+            assertThrows(IllegalArgumentException.class, () -> SensorTopology.buildRapidChange(100, value));
+        }
+    }
+
+    private TopologyTestDriver newRapidChangeDriver() {
+        Properties properties = StreamsConfig.createProperties("unused:9092", "rapid-change-topology-test");
+        properties.setProperty(org.apache.kafka.streams.StreamsConfig.STATE_DIR_CONFIG, tempDir.toString());
+        return new TopologyTestDriver(SensorTopology.buildRapidChange(100, 5.0), properties,
+                Instant.ofEpochMilli(RAPID_CHANGE_START));
+    }
+
+    private static SensorEvent rapidChangeEvent(String eventId, String runId, String deviceId,
+                                                long offsetMs, double temperature) {
+        return new SensorEvent(eventId, runId, deviceId, temperature,
+                RAPID_CHANGE_START + offsetMs, RAPID_CHANGE_START + offsetMs + 500);
+    }
+
+    private static void assertRapidChangeOutputs(TopologyTestDriver driver, SensorEvent[] events,
+                                                 boolean[] triggered, long[] kafkaTimestamps)
+            throws JsonProcessingException {
+        TestInputTopic<String, String> input = driver.createInputTopic("sensor-events",
+                new StringSerializer(), new StringSerializer());
+        TestOutputTopic<String, String> results = driver.createOutputTopic("sensor-results",
+                new StringDeserializer(), new StringDeserializer());
+        TestOutputTopic<String, String> alerts = driver.createOutputTopic("sensor-alerts",
+                new StringDeserializer(), new StringDeserializer());
+        KeyValueStore<String, String> state = driver.getKeyValueStore(StateStoreDefinitions.RAPID_CHANGE_STORE);
+        for (int i = 0; i < events.length; i++) {
+            SensorEvent event = events[i];
+            String key = "original-key-" + event.deviceId();
+            long timestamp = kafkaTimestamps == null ? event.eventTime() : kafkaTimestamps[i];
+            input.pipeInput(key, OBJECT_MAPPER.writeValueAsString(event), Instant.ofEpochMilli(timestamp));
+
+            assertEquals(1L, results.getQueueSize());
+            assertEquals(triggered[i] ? 1L : 0L, alerts.getQueueSize());
+            ObjectNode expectedAlert = expectedFields(event).put("ruleType", "RAPID_CHANGE");
+            KeyValue<String, String> result = results.readKeyValue();
+            assertEquals(key, result.key);
+            assertEquals(expectedAlert.deepCopy().put("triggered", triggered[i]),
+                    OBJECT_MAPPER.readTree(result.value));
+            if (triggered[i]) {
+                KeyValue<String, String> alert = alerts.readKeyValue();
+                assertEquals(key, alert.key);
+                assertEquals(expectedAlert, OBJECT_MAPPER.readTree(alert.value));
+            }
+            assertTrue(results.isEmpty());
+            assertTrue(alerts.isEmpty());
+            String stateKey = event.runId().length() + ":" + event.runId() + event.deviceId();
+            assertEquals(event.eventTime() + ":" + Double.toString(event.temperature()), state.get(stateKey));
         }
     }
 

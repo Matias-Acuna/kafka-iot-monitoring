@@ -269,6 +269,143 @@ class SensorStreamsApplicationTest {
         assertTrue(errors.toString(StandardCharsets.UTF_8).isEmpty());
     }
 
+    @Test
+    void acceptsRapidChangeOptionsWithoutStartingKafkaStreams() throws Exception {
+        assertEquals(Map.of("bootstrap-servers", "unused:9092", "application-id", "rapid-cli-test",
+                "rule", "RAPID_CHANGE", "max-time-difference-ms", "1000",
+                "temperature-change-threshold", "5.0"), parseWithoutStarting(rapidChangeArguments()));
+    }
+
+    @Test
+    void rapidChangeRejectsEachMissingRuleParameter() {
+        for (int index : new int[]{6, 8}) {
+            List<String> arguments = new ArrayList<>(Arrays.asList(rapidChangeArguments()));
+            arguments.subList(index, index + 2).clear();
+            assertRejected(arguments.toArray(String[]::new));
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsInvalidTimeLimits() {
+        for (String value : new String[]{"0", "-1", "not-a-number", "1.5",
+                "9223372036854775808", "-9223372036854775809"}) {
+            String[] arguments = rapidChangeArguments();
+            arguments[7] = value;
+            assertRejected(arguments);
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsInvalidTemperatureChangeThresholds() {
+        for (String value : new String[]{"0", "-0.0", "-1", "NaN", "Infinity", "-Infinity",
+                "not-a-number", "1e309", "1e-400"}) {
+            String[] arguments = rapidChangeArguments();
+            arguments[9] = value;
+            assertRejected(arguments);
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsParametersFromOtherRules() {
+        for (List<String> extra : List.of(List.of("--temperature-threshold", "30.0"),
+                List.of("--window-duration-ms", "1000"), List.of("--count-threshold", "2"),
+                List.of("--window-duration-ms", "1000", "--count-threshold", "2"))) {
+            List<String> arguments = new ArrayList<>(Arrays.asList(rapidChangeArguments()));
+            arguments.addAll(extra);
+            assertRejected(arguments.toArray(String[]::new));
+        }
+    }
+
+    @Test
+    void existingRulesRejectRapidChangeParameters() {
+        for (String[] base : List.of(baseArguments(), highFrequencyArguments())) {
+            for (List<String> extra : List.of(List.of("--max-time-difference-ms", "1000"),
+                    List.of("--temperature-change-threshold", "5.0"))) {
+                List<String> arguments = new ArrayList<>(Arrays.asList(base));
+                arguments.addAll(extra);
+                assertRejected(arguments.toArray(String[]::new));
+            }
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsUnknownAndDuplicateOptions() {
+        List<String> unknown = new ArrayList<>(Arrays.asList(rapidChangeArguments()));
+        unknown.addAll(List.of("--unknown", "value"));
+        assertRejected(unknown.toArray(String[]::new));
+        String[] base = rapidChangeArguments();
+        for (int i = 0; i < base.length; i += 2) {
+            List<String> arguments = new ArrayList<>(Arrays.asList(base));
+            arguments.addAll(List.of(base[i], base[i + 1]));
+            assertRejected(arguments.toArray(String[]::new));
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsMissingCommonOptions() {
+        for (int index : new int[]{0, 2, 4}) {
+            List<String> arguments = new ArrayList<>(Arrays.asList(rapidChangeArguments()));
+            arguments.subList(index, index + 2).clear();
+            assertRejected(arguments.toArray(String[]::new));
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsUnsupportedRuleNames() {
+        for (String rule : new String[]{"UNKNOWN", "rapid_change", "RAPID_CHANGE_OTHER"}) {
+            String[] arguments = rapidChangeArguments();
+            arguments[5] = rule;
+            assertRejected(arguments);
+        }
+    }
+
+    @Test
+    void rapidChangeRejectsMissingEmptyAndBlankValues() {
+        String[] base = rapidChangeArguments();
+        for (int i = 1; i < base.length; i += 2) {
+            for (String value : new String[]{"", " ", "\t\r\n"}) {
+                String[] arguments = base.clone();
+                arguments[i] = value;
+                assertRejected(arguments);
+            }
+            List<String> arguments = new ArrayList<>(Arrays.asList(base));
+            arguments.remove(i);
+            assertRejected(arguments.toArray(String[]::new));
+        }
+    }
+
+    @Test
+    void helpDocumentsRapidChangeAndItsParametersWithoutStartingStreams() {
+        PrintStream originalOut = System.out;
+        PrintStream originalErr = System.err;
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        try (PrintStream capturedOut = new PrintStream(output, true, StandardCharsets.UTF_8);
+             PrintStream capturedErr = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
+            try {
+                System.setOut(capturedOut);
+                System.setErr(capturedErr);
+                assertDoesNotThrow(() -> SensorStreamsApplication.main(new String[]{"--help"}));
+            } finally {
+                System.setOut(originalOut);
+                System.setErr(originalErr);
+            }
+        }
+        String help = output.toString(StandardCharsets.UTF_8);
+        assertTrue(help.contains("--rule HIGH_TEMPERATURE|HIGH_FREQUENCY|RAPID_CHANGE"));
+        int section = help.indexOf("Required for RAPID_CHANGE:");
+        assertTrue(section >= 0);
+        assertTrue(help.substring(section).contains("--max-time-difference-ms LONG"));
+        assertTrue(help.substring(section).contains("--temperature-change-threshold DOUBLE"));
+        assertTrue(errors.toString(StandardCharsets.UTF_8).isEmpty());
+    }
+
+    private static String[] rapidChangeArguments() {
+        return new String[]{"--bootstrap-servers", "unused:9092", "--application-id", "rapid-cli-test",
+                "--rule", "RAPID_CHANGE", "--max-time-difference-ms", "1000",
+                "--temperature-change-threshold", "5.0"};
+    }
+
     private static String[] highFrequencyArguments() {
         return new String[]{"--bootstrap-servers", "unused:9092", "--application-id", "frequency-cli-test",
                 "--rule", "HIGH_FREQUENCY", "--window-duration-ms", "1000", "--count-threshold", "2"};

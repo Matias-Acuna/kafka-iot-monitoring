@@ -15,7 +15,7 @@ import java.util.Set;
 public final class SensorStreamsApplication {
     private static final Set<String> OPTIONS = Set.of(
             "bootstrap-servers", "application-id", "rule", "temperature-threshold",
-            "window-duration-ms", "count-threshold");
+            "window-duration-ms", "count-threshold", "max-time-difference-ms", "temperature-change-threshold");
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(30);
 
     private SensorStreamsApplication() {
@@ -28,12 +28,15 @@ public final class SensorStreamsApplication {
                     Required:
                       --bootstrap-servers HOST:PORT[,HOST:PORT...]
                       --application-id ID
-                      --rule HIGH_TEMPERATURE|HIGH_FREQUENCY
+                      --rule HIGH_TEMPERATURE|HIGH_FREQUENCY|RAPID_CHANGE
                     Required for HIGH_TEMPERATURE:
                       --temperature-threshold DOUBLE (finite Celsius value)
                     Required for HIGH_FREQUENCY:
                       --window-duration-ms LONG (positive milliseconds)
                       --count-threshold INTEGER (positive event count)
+                    Required for RAPID_CHANGE:
+                      --max-time-difference-ms LONG (positive milliseconds)
+                      --temperature-change-threshold DOUBLE (finite and positive)
                     Options belonging to the other rule are rejected.
                     Use --help alone to display this help without starting Kafka Streams.
                     """);
@@ -57,11 +60,20 @@ public final class SensorStreamsApplication {
                 }
                 topology = SensorTopology.build(threshold);
                 ruleDetails = ", temperatureThreshold=" + threshold;
-            } else {
-                long windowDurationMs = positiveLong(options.get("window-duration-ms"));
+            } else if ("HIGH_FREQUENCY".equals(rule)) {
+                long windowDurationMs = positiveLong(options.get("window-duration-ms"), "window-duration-ms");
                 int countThreshold = positiveInt(options.get("count-threshold"));
                 topology = SensorTopology.buildHighFrequency(windowDurationMs, countThreshold);
                 ruleDetails = ", windowDurationMs=" + windowDurationMs + ", countThreshold=" + countThreshold;
+            } else if ("RAPID_CHANGE".equals(rule)) {
+                long maxTimeDifferenceMs = positiveLong(options.get("max-time-difference-ms"),
+                        "max-time-difference-ms");
+                double temperatureChangeThreshold = positiveFiniteDouble(options.get("temperature-change-threshold"));
+                topology = SensorTopology.buildRapidChange(maxTimeDifferenceMs, temperatureChangeThreshold);
+                ruleDetails = ", maxTimeDifferenceMs=" + maxTimeDifferenceMs
+                        + ", temperatureChangeThreshold=" + temperatureChangeThreshold;
+            } else {
+                throw new IllegalArgumentException("Unsupported --rule: " + rule);
             }
 
             Properties properties = StreamsConfig.createProperties(
@@ -116,15 +128,26 @@ public final class SensorStreamsApplication {
             case "HIGH_TEMPERATURE" -> {
                 reject(options, "window-duration-ms");
                 reject(options, "count-threshold");
+                reject(options, "max-time-difference-ms");
+                reject(options, "temperature-change-threshold");
                 require(options, "temperature-threshold");
             }
             case "HIGH_FREQUENCY" -> {
                 reject(options, "temperature-threshold");
+                reject(options, "max-time-difference-ms");
+                reject(options, "temperature-change-threshold");
                 require(options, "window-duration-ms");
                 require(options, "count-threshold");
             }
+            case "RAPID_CHANGE" -> {
+                reject(options, "temperature-threshold");
+                reject(options, "window-duration-ms");
+                reject(options, "count-threshold");
+                require(options, "max-time-difference-ms");
+                require(options, "temperature-change-threshold");
+            }
             default -> throw new IllegalArgumentException("Unsupported --rule: " + options.get("rule")
-                    + "; supported rules: HIGH_TEMPERATURE, HIGH_FREQUENCY");
+                    + "; supported rules: HIGH_TEMPERATURE, HIGH_FREQUENCY, RAPID_CHANGE");
         }
         return options;
     }
@@ -141,16 +164,29 @@ public final class SensorStreamsApplication {
         }
     }
 
-    private static long positiveLong(String value) {
+    private static long positiveLong(String value, String option) {
         try {
             long parsed = Long.parseLong(value);
             if (parsed > 0) {
                 return parsed;
             }
         } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException("--window-duration-ms must be a positive long", exception);
+            throw new IllegalArgumentException("--" + option + " must be a positive long", exception);
         }
-        throw new IllegalArgumentException("--window-duration-ms must be a positive long");
+        throw new IllegalArgumentException("--" + option + " must be a positive long");
+    }
+
+    private static double positiveFiniteDouble(String value) {
+        try {
+            double parsed = Double.parseDouble(value);
+            if (Double.isFinite(parsed) && parsed > 0) {
+                return parsed;
+            }
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException(
+                    "--temperature-change-threshold must be finite and positive", exception);
+        }
+        throw new IllegalArgumentException("--temperature-change-threshold must be finite and positive");
     }
 
     private static int positiveInt(String value) {
