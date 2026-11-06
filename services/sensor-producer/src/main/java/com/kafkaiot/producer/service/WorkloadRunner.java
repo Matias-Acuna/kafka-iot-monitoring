@@ -1,6 +1,7 @@
 package com.kafkaiot.producer.service;
 
 import com.kafkaiot.producer.generation.SensorEventGenerator;
+import com.kafkaiot.producer.io.ProducerEventCsvWriter;
 import com.kafkaiot.producer.model.SensorEvent;
 import org.apache.kafka.clients.producer.RecordMetadata;
 
@@ -99,6 +100,16 @@ public final class WorkloadRunner {
      */
     public void run(BeforePublishCallback beforePublish,
                     PublicationCallback completionCallback) throws InterruptedException {
+        run(beforePublish, completionCallback, null);
+    }
+
+    /**
+     * Adds optional publication observations without changing metrics callbacks.
+     * Close the publisher before flushing/closing the writer to await outcomes and
+     * surface CSV failures separately from publication failures.
+     */
+    public void run(BeforePublishCallback beforePublish, PublicationCallback completionCallback,
+                    ProducerEventCsvWriter writer) throws InterruptedException {
         Objects.requireNonNull(beforePublish, "beforePublish");
         Objects.requireNonNull(completionCallback, "completionCallback");
         long start = System.nanoTime();
@@ -127,7 +138,7 @@ public final class WorkloadRunner {
                         if (outcomeDelivered.compareAndSet(false, true)) {
                             completionCallback.onCompletion(phase, event, metadata, exception);
                         }
-                    });
+                    }, phase, writer);
                 } catch (RuntimeException sendException) {
                     if (outcomeDelivered.compareAndSet(false, true)) {
                         try {

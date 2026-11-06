@@ -1,12 +1,21 @@
 package com.kafkaiot.producer.service;
 
 import com.kafkaiot.producer.config.ProducerKafkaConfig;
+import com.kafkaiot.producer.io.ProducerEventCsvWriter;
+import com.kafkaiot.producer.io.ProducerEventCsvWriter.Status;
 import com.kafkaiot.producer.model.SensorEvent;
+import com.kafkaiot.producer.service.WorkloadRunner.Phase;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Publishes sensor events asynchronously to Kafka.
@@ -15,7 +24,13 @@ public final class SensorEventPublisher implements AutoCloseable {
     private static final String TOPIC = "sensor-events";
     private static final char[] HEX = "0123456789abcdef".toCharArray();
 
-    private final KafkaProducer<String, String> producer;
+    private final Producer<String, String> producer;
+    private final AtomicReference<IOException> observationFailure = new AtomicReference<>();
+
+    // Allows broker-free lifecycle tests using Kafka's MockProducer.
+    SensorEventPublisher(Producer<String, String> producer) {
+        this.producer = Objects.requireNonNull(producer, "producer");
+    }
 
     public SensorEventPublisher(String bootstrapServers) {
         producer = new KafkaProducer<>(ProducerKafkaConfig.createProperties(bootstrapServers));
@@ -35,8 +50,20 @@ public final class SensorEventPublisher implements AutoCloseable {
      * synchronous Kafka send failures are thrown directly to the caller.
      */
     public void publish(SensorEvent event, Callback callback) {
+        publish(event, callback, null, null);
+    }
+
+    /**
+     * Optionally records observations using the exact event serialized to Kafka.
+     * CSV failures never replace Kafka outcomes; close() surfaces them after draining.
+     * The caller owns the writer and must close it after this publisher.
+     */
+    public void publish(SensorEvent event, Callback callback, Phase phase, ProducerEventCsvWriter writer) {
         Objects.requireNonNull(event, "event must not be null");
         Objects.requireNonNull(callback, "callback must not be null");
+        if (writer != null) {
+            Objects.requireNonNull(phase, "phase");
+        }
         if (!Double.isFinite(event.temperature())) {
             throw new IllegalArgumentException("temperature must be finite for JSON");
         }
@@ -46,7 +73,42 @@ public final class SensorEventPublisher implements AutoCloseable {
                 System.currentTimeMillis());
         ProducerRecord<String, String> record = new ProducerRecord<>(
                 TOPIC, sentEvent.deviceId(), toJson(sentEvent));
-        producer.send(record, callback);
+        if (writer == null) {
+            producer.send(record, callback);
+            return;
+        }
+        observe(writer, sentEvent, phase, Status.ATTEMPTED, null, null, System.currentTimeMillis());
+        AtomicBoolean outcomeDelivered = new AtomicBoolean();
+        Callback observedCallback = (metadata, exception) -> {
+            long recordedAt = System.currentTimeMillis();
+            if (outcomeDelivered.compareAndSet(false, true)) {
+                observe(writer, sentEvent, phase, exception == null ? Status.CONFIRMED : Status.FAILED,
+                        metadata, exception, recordedAt);
+                callback.onCompletion(metadata, exception);
+            }
+        };
+        try {
+            producer.send(record, observedCallback);
+        } catch (RuntimeException sendException) {
+            if (outcomeDelivered.compareAndSet(false, true)) {
+                observe(writer, sentEvent, phase, Status.FAILED, null, sendException, System.currentTimeMillis());
+            }
+            throw sendException;
+        }
+    }
+
+    private void observe(ProducerEventCsvWriter writer, SensorEvent event, Phase phase, Status status,
+                         RecordMetadata metadata, Exception exception, long recordedAt) {
+        try {
+            writer.writeObservation(event, phase, recordedAt, status,
+                    metadata != null && metadata.partition() >= 0 ? metadata.partition() : null,
+                    metadata != null && metadata.hasOffset() ? metadata.offset() : null,
+                    exception == null ? null : exception.toString());
+        } catch (IOException ioException) {
+            if (observationFailure.compareAndSet(null, ioException)) {
+                System.err.println("Producer observation CSV write failed: " + ioException);
+            }
+        }
     }
 
     private static String toJson(SensorEvent event) {
@@ -92,6 +154,18 @@ public final class SensorEventPublisher implements AutoCloseable {
 
     @Override
     public void close() {
-        producer.close();
+        try {
+            producer.close();
+        } catch (RuntimeException exception) {
+            IOException failure = observationFailure.get();
+            if (failure != null) {
+                exception.addSuppressed(new UncheckedIOException("Producer observation CSV write failed", failure));
+            }
+            throw exception;
+        }
+        IOException failure = observationFailure.get();
+        if (failure != null) {
+            throw new UncheckedIOException("Producer observation CSV write failed", failure);
+        }
     }
 }

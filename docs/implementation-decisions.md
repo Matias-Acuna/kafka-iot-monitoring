@@ -152,3 +152,100 @@ Runtime configuration can be supplied explicitly through CLI arguments for each 
 This decision applies only to the Measurement Consumer. All previous implementation decisions remain unchanged.
 
 This is an explicitly approved implementation adaptation. The original Phase D protocol remains unchanged.
+
+## D.6.2 — FD6 Experimental Metrics and Export Design
+
+- **Approval date:** 2026-11-06
+- **Status:** Approved by the project owner
+- **Component:** FD6 experimental metrics and exports across the Sensor Producer, Kafka Streams, and Measurement Consumer
+
+### Approved implementation design
+
+FD6 will implement the following experimental measurements:
+
+- Attempted input throughput and confirmed input throughput.
+- Unique results throughput, with per-second observations.
+- Per-second observations of attempted and confirmed inputs, and alerts per second as a secondary metric.
+- Individual end-to-end latency and P50, P95, and P99 latency percentiles.
+- Missing results and duplicate deliveries, counted separately.
+- Production and processing errors.
+- Interruption and recovery observations.
+- Broker leadership and in-sync replica (ISR) observations.
+
+These are approved implementation requirements, not a claim that all measurements or exports already exist.
+
+### Latency and percentile calculation
+
+Calculate individual end-to-end latency in milliseconds as:
+
+```text
+latencyMs = resultReceivedAt - sentAt
+```
+
+Calculate P50, P95, and P99 using Type 7 linear interpolation, with P50 representing the median. Use unique measurement-event results, including eligible results received during drain. Retain and flag negative latency observations instead of silently converting them to zero.
+
+### Experimental phases and throughput
+
+The approved ordinary experimental phases are:
+
+| Phase | Duration |
+| --- | --- |
+| `WARM_UP` | 60 seconds |
+| `MEASUREMENT` | 300 seconds |
+| `DRAIN` | Up to 120 seconds |
+
+Results from measurement-phase events received during drain count for latency and completeness checks, but not for measured throughput during the 300-second measurement interval. Throughput observations must use actual elapsed time, not simulated `eventTime`.
+
+### Reliability accounting
+
+- Identify events by `(runId, eventId)` and retain confirmed producer event identities.
+- Count unique received results separately from duplicate deliveries.
+- Reconcile confirmed inputs against unique received results after the drain boundary.
+- Do not automatically equate missing results with Kafka data loss.
+
+### Experimental export structure
+
+Store each run's experimental observations under:
+
+```text
+experiments/results/<runId>/
+    run-config.json
+    producer-events.csv
+    sensor-results.csv
+    throughput.csv
+    summary.json
+    errors.log
+```
+
+| File | Intended purpose |
+| --- | --- |
+| `run-config.json` | Record the actual configuration, workload parameters, random seeds, and phase boundaries. |
+| `producer-events.csv` | Preserve individual producer event identities and publication outcomes, including confirmation evidence for reconciliation. |
+| `sensor-results.csv` | Preserve individual received-result observations, including receipt timestamps, calculated latency, duplicate status, and negative-latency flags. |
+| `throughput.csv` | Record per-second attempted input, confirmed input, unique result, and secondary alert observations using actual elapsed time. |
+| `summary.json` | Record measured run summaries, latency percentiles, reliability accounting, and execution completion status. |
+| `errors.log` | Preserve production and processing errors and interruption, recovery, broker leadership, and ISR observations. |
+
+Preserve available partial observations from incomplete executions and explicitly record their completion status. Incomplete executions must not be presented as valid completed experimental runs. Store experimental observations separately from dashboard visualization.
+
+### B4 experimental implications
+
+B4 retains its special experimental procedure and provisional recovery criteria defined in Chapter 4:
+
+- Service rates must reach at least 95% of the pre-failure reference for 30 seconds, without sustained growth of pending events.
+- The pre-failure reference is based on the 60 seconds immediately before broker interruption.
+- Full ISR recovery must be maintained for 30 seconds.
+- These provisional recovery criteria require validation through pilot tests.
+
+### Technical rationale and implementation restrictions
+
+- Reuse existing components wherever possible and avoid unnecessary dependencies and services.
+- Prefer progressive writing of individual measurements to limit memory usage.
+- Preserve the existing Kafka message contracts and established processing rules.
+- Do not change Chapter 4 or its experimental methodology.
+- Do not execute final B1–B4 experiments in FD6.
+- Preserve the separation between FD6 metrics, FD7 dashboard visualization, and FD8 experiments.
+
+### Scope and traceability
+
+This decision records implementation details formally approved by the project owner for FD6. It does not replace or modify the official Phase D protocol or the methodology in Chapter 4. All previous implementation decisions remain unchanged.
