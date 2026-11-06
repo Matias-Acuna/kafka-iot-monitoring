@@ -112,4 +112,40 @@ class DashboardControllerTest {
         assertThrows(IllegalArgumentException.class, () -> new DashboardController(65536, new MeasurementAggregator()));
         assertThrows(NullPointerException.class, () -> new DashboardController(0, null));
     }
+    @Test
+    void legacyConstructorKeepsTheIpv4LoopbackBinding() throws Exception {
+        try (var dashboard = new DashboardController(0, new MeasurementAggregator())) {
+            assertEquals("127.0.0.1", dashboard.bindAddress().getAddress().getHostAddress());
+            assertTrue(dashboard.bindAddress().getAddress().isLoopbackAddress());
+        }
+    }
+
+    @Test
+    void explicitWildcardBindsAllIpv4InterfacesAndPreservesTheMetricsEndpoint() throws Exception {
+        try (var client = HttpClient.newHttpClient();
+             var dashboard = new DashboardController("0.0.0.0", 0, new MeasurementAggregator())) {
+            assertTrue(dashboard.bindAddress().getAddress().isAnyLocalAddress());
+            dashboard.start();
+            // get() connects to literal IPv4 127.0.0.1, regardless of the wildcard's textual representation.
+            var response = get(client, dashboard.port(), "/metrics/dashboard");
+            assertEquals("127.0.0.1", response.uri().getHost());
+            assertEquals(200, response.statusCode());
+            assertTrue(response.headers().firstValue("Content-Type").orElseThrow().startsWith("application/json"));
+            var json = new ObjectMapper().readTree(response.body());
+            assertTrue(json.isObject());
+            assertTrue(json.has("totalResults"));
+        }
+    }
+
+    @Test
+    void hostnameAndIpSyntaxAreValidatedWithoutOpeningAListener() {
+        for (String host : new String[]{"127.0.0.1", "0.0.0.0", "localhost", "::1"}) {
+            assertEquals(host, DashboardController.validateHost(host));
+        }
+        for (String host : new String[]{"", " ", "host name", "http://localhost", "127.0.0.1:8080", "host/path", "host?x"}) {
+            assertThrows(IllegalArgumentException.class, () -> DashboardController.validateHost(host), host);
+        }
+        assertThrows(IllegalArgumentException.class, () -> DashboardController.validateHost(null));
+    }
+
 }

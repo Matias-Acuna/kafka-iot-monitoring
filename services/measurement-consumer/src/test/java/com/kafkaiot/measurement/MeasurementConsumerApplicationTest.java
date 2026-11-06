@@ -761,5 +761,41 @@ class MeasurementConsumerApplicationTest {
             assertEquals(0, completed.getCount());
         }
     }
+    @Test
+    void dashboardHostIsOptionalAndDoesNotEnableTheDashboardByItself() throws Exception {
+        var parse = MeasurementConsumerApplication.class.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        var defaults = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group"});
+        assertFalse(defaults.containsKey("dashboard-host"));
+        for (String host : List.of("127.0.0.1", "0.0.0.0", "localhost")) {
+            @SuppressWarnings("unchecked")
+            var parsed = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                    "--bootstrap-servers", "broker:9092", "--group-id", "group", "--dashboard-host", host});
+            assertEquals(host, parsed.get("dashboard-host"));
+            assertFalse(parsed.containsKey("dashboard-port"));
+            var open = MeasurementConsumerApplication.class.getDeclaredMethod("openDashboard", Map.class, MeasurementAggregator.class);
+            open.setAccessible(true);
+            assertNull(open.invoke(null, parsed, new MeasurementAggregator()));
+        }
+    }
+
+    @Test
+    void dashboardHostRejectsMalformedValuesAndAcceptsExplicitHostAndPort() throws Exception {
+        var parse = MeasurementConsumerApplication.class.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        var parsed = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group",
+                "--dashboard-host", "0.0.0.0", "--dashboard-port", "8080"});
+        assertEquals("0.0.0.0", parsed.get("dashboard-host"));
+        assertEquals("8080", parsed.get("dashboard-port"));
+        for (String host : List.of(" ", "http://localhost", "host/path", "localhost:8080")) {
+            var failure = assertThrows(InvocationTargetException.class, () -> parse.invoke(null, (Object) new String[]{
+                    "--bootstrap-servers", "broker:9092", "--group-id", "group", "--dashboard-host", host}));
+            assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+        }
+    }
 
 }

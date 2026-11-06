@@ -8,6 +8,8 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Objects;
@@ -25,9 +27,16 @@ public final class DashboardController implements AutoCloseable {
 
     /** Port zero supports isolated local tests; the application CLI requires 1..65535. */
     public DashboardController(int port, MeasurementAggregator aggregator) throws IOException {
+        this("127.0.0.1", port, aggregator);
+    }
+
+    /** Explicit binding; 0.0.0.0 listens on all IPv4 interfaces. */
+    public DashboardController(String host, int port, MeasurementAggregator aggregator) throws IOException {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid dashboard port");
         this.aggregator = Objects.requireNonNull(aggregator, "aggregator");
-        server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+        InetSocketAddress address = new InetSocketAddress(validateHost(host), port);
+        if (address.isUnresolved()) throw new IllegalArgumentException("Dashboard host could not be resolved: " + host);
+        server = HttpServer.create(address, 0);
         try {
             aggregator.enableDashboard();
             server.createContext("/", this::handle);
@@ -35,6 +44,28 @@ public final class DashboardController implements AutoCloseable {
             server.stop(0);
             throw failure;
         }
+    }
+
+    /** Validate host syntax without DNS lookups or opening a listener. */
+    public static String validateHost(String host) {
+        if (host == null || host.isBlank() || host.chars().anyMatch(Character::isWhitespace)) {
+            throw new IllegalArgumentException("--dashboard-host requires a hostname or IP address");
+        }
+        try {
+            URI address = new URI("http", null, host, -1, null, null, null);
+            if (address.getHost() == null || address.getPort() != -1 || address.getRawUserInfo() != null
+                    || (address.getRawPath() != null && !address.getRawPath().isEmpty())
+                    || address.getRawQuery() != null || address.getRawFragment() != null) {
+                throw new URISyntaxException(host, "Only a hostname or IP address is allowed");
+            }
+        } catch (URISyntaxException failure) {
+            throw new IllegalArgumentException("--dashboard-host must be a hostname or IP address without a scheme, port or path", failure);
+        }
+        return host;
+    }
+
+    public InetSocketAddress bindAddress() {
+        return server.getAddress();
     }
 
     public synchronized void start() {

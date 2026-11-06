@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
 /** Standalone Measurement Consumer entry point with explicit CLI configuration. */
 public final class MeasurementConsumerApplication {
     private static final Set<String> OPTIONS = Set.of(
-            "bootstrap-servers", "group-id", "auto-offset-reset", "result-csv-output", "readiness-stdout", "run-id", "dashboard-port");
+            "bootstrap-servers", "group-id", "auto-offset-reset", "result-csv-output", "readiness-stdout", "run-id", "dashboard-port", "dashboard-host");
 
     private MeasurementConsumerApplication() {
     }
@@ -39,7 +39,8 @@ public final class MeasurementConsumerApplication {
                     Optional:
                       --auto-offset-reset earliest|latest (default: earliest)
                       --run-id ID (optional; record observations only for this run)
-                      --dashboard-port PORT (1..65535; optional HTTP dashboard on 127.0.0.1)
+                      --dashboard-port PORT (1..65535; enables the optional HTTP dashboard)
+                      --dashboard-host HOST (default: 127.0.0.1; 0.0.0.0 binds all IPv4 interfaces)
                       --readiness-stdout true|false (default: false; Consumer lifecycle JSON evidence)
                       --result-csv-output PATH (new file; e.g. experiments/results/<runId>/sensor-results.csv)
                     Use --help alone to display this help without starting the consumer.
@@ -134,7 +135,8 @@ public final class MeasurementConsumerApplication {
     private static DashboardController openDashboard(Map<String, String> options, MeasurementAggregator aggregator) {
         if (!options.containsKey("dashboard-port")) return null;
         try {
-            DashboardController dashboard = new DashboardController(dashboardPort(options.get("dashboard-port")), aggregator);
+            DashboardController dashboard = new DashboardController(options.getOrDefault("dashboard-host", "127.0.0.1"),
+                    dashboardPort(options.get("dashboard-port")), aggregator);
             try {
                 dashboard.start();
                 return dashboard;
@@ -345,6 +347,7 @@ public final class MeasurementConsumerApplication {
             throw new IllegalArgumentException("--auto-offset-reset must be earliest or latest");
         }
         if (options.containsKey("dashboard-port")) dashboardPort(options.get("dashboard-port"));
+        if (options.containsKey("dashboard-host")) DashboardController.validateHost(options.get("dashboard-host"));
         return options;
     }
 }
