@@ -29,7 +29,7 @@ public final class SensorProducerApplication {
     private static final Set<String> OPTIONS = Set.of(
             "bootstrap-servers", "run-id", "random-seed", "initial-event-timestamp",
             "timestamp-increment", "target-events-per-second", "warm-up-seconds",
-            "measurement-seconds", "csv-output", "acks", "enable-idempotence", "event-csv-output", "run-config-output");
+            "measurement-seconds", "csv-output", "acks", "enable-idempotence", "event-csv-output", "run-config-output", "timing-stdout");
 
     private SensorProducerApplication() {
     }
@@ -47,6 +47,7 @@ public final class SensorProducerApplication {
                       --target-events-per-second DOUBLE (finite and positive)
                       --csv-output PATH
                     Optional:
+                      --timing-stdout true|false  (default: false; one workload timing JSON event)
                       --run-config-output PATH    (e.g. experiments/results/<runId>/run-config.json)
                       --event-csv-output PATH     (new file; e.g. experiments/results/<runId>/producer-events.csv)
                       --warm-up-seconds LONG      (default from WorkloadRunner: 60)
@@ -78,6 +79,10 @@ public final class SensorProducerApplication {
     static void execute(Map<String, String> options, PublisherFactory publisherFactory) throws Exception {
         String bootstrap = required(options, "bootstrap-servers");
         String runId = required(options, "run-id");
+        String timingStdout = options.getOrDefault("timing-stdout", "false");
+        if (!"true".equals(timingStdout) && !"false".equals(timingStdout)) {
+            throw new IllegalArgumentException("--timing-stdout must be true or false");
+        }
         long seed = longValue(options, "random-seed");
         long initialTimestamp = longValue(options, "initial-event-timestamp");
         long increment = longValue(options, "timestamp-increment");
@@ -170,7 +175,8 @@ public final class SensorProducerApplication {
                                             } else {
                                                 metrics.recordFailure(phase, exception.toString());
                                             }
-                                        }, eventWriter);
+                                        }, eventWriter, "true".equals(timingStdout)
+                                                ? timing -> printTiming(runId, timing) : null);
                             } catch (InterruptedException exception) {
                                 interrupted = true;
                                 // Allow resource closure to await callbacks; restore status below.
@@ -256,6 +262,26 @@ public final class SensorProducerApplication {
                 }
                 throw exception;
             }
+        }
+    }
+
+    public record TimingEvidence(String evidenceType, String runId, long workloadStartNs,
+                                 long workloadStartEpochMs, long sampleSpanNs, long warmUpDurationNs,
+                                 long measurementDurationNs, long measurementStartEpochMs,
+                                 long measurementDeadlineEpochMs, String epochAlignment) { }
+
+    static void printTiming(String runId, WorkloadRunner.Timing timing) {
+        TimingEvidence evidence = new TimingEvidence("PRODUCER_WORKLOAD_TIMING", runId,
+                timing.workloadStartNs(), timing.workloadStartEpochMs(), timing.sampleSpanNs(),
+                timing.warmUpDurationNs(), timing.measurementDurationNs(), timing.measurementStartEpochMs(),
+                timing.measurementDeadlineEpochMs(), "DERIVED_FROM_BRACKETED_CLOCK_SAMPLE");
+        try {
+            System.out.println(new ObjectMapper().writeValueAsString(evidence));
+            if (System.out.checkError()) {
+                throw new IllegalStateException("Producer timing evidence stdout could not be written");
+            }
+        } catch (com.fasterxml.jackson.core.JsonProcessingException exception) {
+            throw new IllegalStateException("Producer timing evidence could not be serialized", exception);
         }
     }
 
@@ -358,10 +384,8 @@ public final class SensorProducerApplication {
                         .put("measurementDurationNs", timing.measurementDurationNs());
                 data.putObject("scheduled").put("measurementStartOffsetNs", timing.measurementStartOffsetNs())
                         .put("measurementDeadlineOffsetNs", timing.measurementDeadlineOffsetNs())
-                        .put("measurementStartEpochMs", Math.addExact(timing.workloadStartEpochMs(),
-                                timing.measurementStartOffsetNs() / 1_000_000L))
-                        .put("measurementDeadlineEpochMs", Math.addExact(timing.workloadStartEpochMs(),
-                                timing.measurementDeadlineOffsetNs() / 1_000_000L))
+                        .put("measurementStartEpochMs", timing.measurementStartEpochMs())
+                        .put("measurementDeadlineEpochMs", timing.measurementDeadlineEpochMs())
                         .put("epochAlignment", "DERIVED_FROM_BRACKETED_CLOCK_SAMPLE");
                 data.withObject("observed").put("generationStoppedElapsedNs", timing.generationStoppedElapsedNs())
                         .put("generationStoppedEpochMs", timing.generationStoppedEpochMs());

@@ -7,6 +7,8 @@ import org.apache.kafka.streams.Topology;
 
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -15,7 +17,7 @@ import java.util.Set;
 public final class SensorStreamsApplication {
     private static final Set<String> OPTIONS = Set.of(
             "bootstrap-servers", "application-id", "rule", "temperature-threshold",
-            "window-duration-ms", "count-threshold", "max-time-difference-ms", "temperature-change-threshold");
+            "window-duration-ms", "count-threshold", "max-time-difference-ms", "temperature-change-threshold", "lifecycle-stdout");
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(30);
 
     private SensorStreamsApplication() {
@@ -37,6 +39,8 @@ public final class SensorStreamsApplication {
                     Required for RAPID_CHANGE:
                       --max-time-difference-ms LONG (positive milliseconds)
                       --temperature-change-threshold DOUBLE (finite and positive)
+                    Optional:
+                      --lifecycle-stdout true|false (default: false; lifecycle JSON evidence)
                     Options belonging to the other rule are rejected.
                     Use --help alone to display this help without starting Kafka Streams.
                     """);
@@ -48,6 +52,7 @@ public final class SensorStreamsApplication {
             String rule = options.get("rule");
             Topology topology;
             String ruleDetails;
+            Map<String, Object> ruleParameters;
             if ("HIGH_TEMPERATURE".equals(rule)) {
                 double threshold;
                 try {
@@ -59,17 +64,21 @@ public final class SensorStreamsApplication {
                     throw new IllegalArgumentException("--temperature-threshold must be finite");
                 }
                 topology = SensorTopology.build(threshold);
+                ruleParameters = Map.of("temperatureThreshold", threshold);
                 ruleDetails = ", temperatureThreshold=" + threshold;
             } else if ("HIGH_FREQUENCY".equals(rule)) {
                 long windowDurationMs = positiveLong(options.get("window-duration-ms"), "window-duration-ms");
                 int countThreshold = positiveInt(options.get("count-threshold"));
                 topology = SensorTopology.buildHighFrequency(windowDurationMs, countThreshold);
+                ruleParameters = Map.of("windowDurationMs", windowDurationMs, "countThreshold", countThreshold);
                 ruleDetails = ", windowDurationMs=" + windowDurationMs + ", countThreshold=" + countThreshold;
             } else if ("RAPID_CHANGE".equals(rule)) {
                 long maxTimeDifferenceMs = positiveLong(options.get("max-time-difference-ms"),
                         "max-time-difference-ms");
                 double temperatureChangeThreshold = positiveFiniteDouble(options.get("temperature-change-threshold"));
                 topology = SensorTopology.buildRapidChange(maxTimeDifferenceMs, temperatureChangeThreshold);
+                ruleParameters = Map.of("maxTimeDifferenceMs", maxTimeDifferenceMs,
+                        "temperatureChangeThreshold", temperatureChangeThreshold);
                 ruleDetails = ", maxTimeDifferenceMs=" + maxTimeDifferenceMs
                         + ", temperatureChangeThreshold=" + temperatureChangeThreshold;
             } else {
@@ -78,10 +87,20 @@ public final class SensorStreamsApplication {
 
             Properties properties = StreamsConfig.createProperties(
                     options.get("bootstrap-servers"), options.get("application-id"));
+            emitConfiguration(properties, rule, ruleParameters,
+                    "true".equals(options.get("lifecycle-stdout")));
             KafkaStreams streams = new KafkaStreams(topology, properties);
+            StreamsLifecycleEvidence lifecycle = "true".equals(options.get("lifecycle-stdout"))
+                    ? new StreamsLifecycleEvidence(options.get("application-id"), StreamsLifecycleEvidence::print) : null;
             try {
+                if (lifecycle != null) {
+                    streams.setStateListener(lifecycle);
+                    lifecycle.startup(streams.state());
+                }
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                    if (!streams.close(CLOSE_TIMEOUT)) {
+                    boolean closed = lifecycle == null ? streams.close(CLOSE_TIMEOUT)
+                            : lifecycle.close(() -> streams.close(CLOSE_TIMEOUT), streams::state, true);
+                    if (!closed) {
                         System.err.println("Kafka Streams shutdown did not complete within 30 seconds.");
                     }
                 }, "sensor-streams-shutdown"));
@@ -90,8 +109,17 @@ public final class SensorStreamsApplication {
                         + options.get("application-id") + ", rule=" + rule
                         + ruleDetails);
             } catch (RuntimeException exception) {
+                if (lifecycle != null) {
+                    try {
+                        lifecycle.failure(streams.state(), exception);
+                    } catch (RuntimeException evidenceFailure) {
+                        if (exception != evidenceFailure) exception.addSuppressed(evidenceFailure);
+                    }
+                }
                 try {
-                    if (!streams.close(CLOSE_TIMEOUT)) {
+                    boolean closed = lifecycle == null ? streams.close(CLOSE_TIMEOUT)
+                            : lifecycle.close(() -> streams.close(CLOSE_TIMEOUT), streams::state, false);
+                    if (!closed) {
                         System.err.println("Kafka Streams cleanup did not complete within 30 seconds.");
                     }
                 } catch (RuntimeException closeException) {
@@ -104,6 +132,42 @@ public final class SensorStreamsApplication {
         } catch (RuntimeException exception) {
             System.err.println("Kafka Streams startup failed: " + exception);
             throw exception;
+        }
+    }
+
+    record ConfigurationEvidence(String evidenceType, long observedAtEpochMs, String applicationId,
+                                 String rule, Map<String, Object> ruleParameters,
+                                 Map<String, Object> appliedConfiguration,
+                                 List<String> unavailable) { }
+
+    /** Uses the same properties and typed parameters passed to Kafka Streams and the topology. */
+    static void emitConfiguration(Properties properties, String rule, Map<String, Object> parameters,
+                                  boolean enabled) {
+        if (enabled) StreamsLifecycleEvidence.print(configurationEvidence(properties, rule, parameters));
+    }
+
+    static ConfigurationEvidence configurationEvidence(Properties properties, String rule,
+                                                         Map<String, Object> parameters) {
+        var config = new ConfigurationView(properties);
+        Map<String, Object> applied = new LinkedHashMap<>();
+        // Explicit allowlist: never enumerate originals, which may contain credentials.
+        for (String key : List.of("application.id", "bootstrap.servers", "processing.guarantee",
+                "num.stream.threads", "default.key.serde", "default.value.serde", "state.dir",
+                "commit.interval.ms", "num.standby.replicas", "replication.factor",
+                "topology.optimization", "statestore.cache.max.bytes", "max.task.idle.ms",
+                "security.protocol", "default.timestamp.extractor")) {
+            Object value = config.values().get(key);
+            applied.put(key, value instanceof Class<?> type ? type.getName() : value);
+        }
+        return new ConfigurationEvidence("KAFKA_STREAMS_CONFIGURATION", System.currentTimeMillis(),
+                config.getString("application.id"), rule, Map.copyOf(parameters), applied,
+                List.of("runtimeGeneratedClientIds", "brokerEffectiveTopicConfiguration"));
+    }
+
+    /** Parses Kafka defaults/post-processing without logging unrelated sensitive settings. */
+    private static final class ConfigurationView extends org.apache.kafka.streams.StreamsConfig {
+        private ConfigurationView(Properties properties) {
+            super(properties, false);
         }
     }
 
@@ -123,6 +187,10 @@ public final class SensorStreamsApplication {
         }
         for (String required : new String[]{"bootstrap-servers", "application-id", "rule"}) {
             require(options, required);
+        }
+        String lifecycle = options.getOrDefault("lifecycle-stdout", "false");
+        if (!"true".equals(lifecycle) && !"false".equals(lifecycle)) {
+            throw new IllegalArgumentException("--lifecycle-stdout must be true or false");
         }
         switch (options.get("rule")) {
             case "HIGH_TEMPERATURE" -> {

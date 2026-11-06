@@ -1,0 +1,3 @@
+runId,phase,attempted,confirmed,failed,latestError
+streams-functional-d344,WARM_UP,1,1,0,
+streams-functional-d344,MEASUREMENT,33,33,0,

@@ -1,0 +1,3 @@
+runId,phase,attempted,confirmed,failed,latestError
+fd6-metadata-smoke-20261106T160050Z-493,WARM_UP,0,0,0,
+fd6-metadata-smoke-20261106T160050Z-493,MEASUREMENT,29,29,0,

@@ -1,0 +1,27 @@
+[[1;34mINFO[m] Scanning for projects...
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m-------------------< [0;36mcom.kafka.iot:sensor-producer[0;1m >--------------------[m
+[[1;34mINFO[m] [1mBuilding sensor-producer 1.0-SNAPSHOT[m
+[[1;34mINFO[m]   from pom.xml
+[[1;34mINFO[m] [1m--------------------------------[ jar ]---------------------------------[m
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mresources:3.3.1:resources[m [1m(default-resources)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] skip non existing resourceDirectory /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/sensor-producer/src/main/resources
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mcompiler:3.14.1:compile[m [1m(default-compile)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] Recompiling the module because of [1madded or removed source files[m.
+[[1;34mINFO[m] Compiling 10 source files with javac [debug release 21] to target/classes
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mdependency:3.7.0:build-classpath[m [1m(default-cli)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] Wrote classpath file '/mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/sensor-producer/target/classpath.txt'.
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] [1;32mBUILD SUCCESS[m
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] Total time:  3.851 s
+[[1;34mINFO[m] Finished at: 2026-11-06T19:31:04+01:00
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+{"evidenceType":"PRODUCER_WORKLOAD_TIMING","runId":"fd6-b1-smoke-20261106T182947910433Z","workloadStartNs":40963340799763,"workloadStartEpochMs":1793989866970,"sampleSpanNs":1540,"warmUpDurationNs":60000000000,"measurementDurationNs":300000000000,"measurementStartEpochMs":1793989926970,"measurementDeadlineEpochMs":1793990226970,"epochAlignment":"DERIVED_FROM_BRACKETED_CLOCK_SAMPLE"}
+runId=fd6-b1-smoke-20261106T182947910433Z targetEventsPerSecond=10.0
+WARM_UP attempted=585 confirmed=585 failed=0 unmatched=0
+MEASUREMENT attempted=3000 confirmed=3000 failed=0 unmatched=0
+Final CSV exported: /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/experiments/results/fd6-b1-smoke-20261106T182947910433Z/producer-totals.csv

@@ -1,0 +1,3 @@
+runId,phase,attempted,confirmed,failed,latestError
+fd6-b1-retest-20261106T185117690107Z,WARM_UP,585,585,0,
+fd6-b1-retest-20261106T185117690107Z,MEASUREMENT,3000,3000,0,

@@ -1,0 +1,26 @@
+[[1;34mINFO[m] Scanning for projects...
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m-------------------< [0;36mcom.kafka.iot:sensor-producer[0;1m >--------------------[m
+[[1;34mINFO[m] [1mBuilding sensor-producer 1.0-SNAPSHOT[m
+[[1;34mINFO[m]   from pom.xml
+[[1;34mINFO[m] [1m--------------------------------[ jar ]---------------------------------[m
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mresources:3.3.1:resources[m [1m(default-resources)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] skip non existing resourceDirectory /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/sensor-producer/src/main/resources
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mcompiler:3.14.1:compile[m [1m(default-compile)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] Nothing to compile - all classes are up to date.
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mdependency:3.7.0:build-classpath[m [1m(default-cli)[m @ [36msensor-producer[0;1m ---[m
+[[1;34mINFO[m] Skipped writing classpath file '/mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/sensor-producer/target/classpath.txt'.  No changes found.
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] [1;32mBUILD SUCCESS[m
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] Total time:  1.230 s
+[[1;34mINFO[m] Finished at: 2026-11-06T19:53:04+01:00
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+{"evidenceType":"PRODUCER_WORKLOAD_TIMING","runId":"fd6-b1-retest-20261106T185117690107Z","workloadStartNs":42283099365550,"workloadStartEpochMs":1793991186658,"sampleSpanNs":1055,"warmUpDurationNs":60000000000,"measurementDurationNs":300000000000,"measurementStartEpochMs":1793991246658,"measurementDeadlineEpochMs":1793991546658,"epochAlignment":"DERIVED_FROM_BRACKETED_CLOCK_SAMPLE"}
+runId=fd6-b1-retest-20261106T185117690107Z targetEventsPerSecond=10.0
+WARM_UP attempted=585 confirmed=585 failed=0 unmatched=0
+MEASUREMENT attempted=3000 confirmed=3000 failed=0 unmatched=0
+Final CSV exported: /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/experiments/results/fd6-b1-retest-20261106T185117690107Z/producer-totals.csv

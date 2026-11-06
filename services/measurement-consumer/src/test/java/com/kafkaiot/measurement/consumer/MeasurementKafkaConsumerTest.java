@@ -193,6 +193,68 @@ class MeasurementKafkaConsumerTest {
         assertTrue(kafka.closed());
     }
 
+    @Test
+    void runIsolationExcludesForeignResultsAndAlertsButKeepsEveryActiveDelivery() throws Exception {
+        var kafka = new TrackingConsumer();
+        var aggregator = new MeasurementAggregator();
+        var foreign = new SensorResult("event-1", "functional-test-d218", RESULT.deviceId(),
+                RESULT.eventTime(), RESULT.sentAt(), RESULT.ruleType(), false);
+        var foreignAlert = new SensorAlert("alert-old", "functional-test-d218", RESULT.deviceId(),
+                RESULT.eventTime(), RESULT.sentAt(), RESULT.ruleType());
+        Path output = tempDir.resolve("isolated.csv");
+        try (var writer = new SensorResultCsvWriter(output)) {
+            var consumer = new MeasurementKafkaConsumer(kafka, aggregator, writer, null, null,
+                    System::nanoTime, "run-1");
+            runRecords(consumer, kafka, resultRecord(0, foreign), resultRecord(1, RESULT),
+                    resultRecord(2, RESULT), alertRecord(),
+                    new ConsumerRecord<>("sensor-alerts", 0, 1, "device-1", OBJECT_MAPPER.writeValueAsString(foreignAlert)));
+            writer.flush();
+            assertEquals(2, aggregator.getReceivedResultCount());
+            assertEquals(1, aggregator.getUniqueResultCount());
+            assertEquals(1, aggregator.getDuplicateResultCount());
+            assertEquals(1, aggregator.getReceivedAlertCount());
+            assertEquals(1, consumer.getIgnoredForeignResults());
+            assertEquals(1, consumer.getIgnoredForeignAlerts());
+            var rows = Files.readAllLines(output);
+            assertEquals(3, rows.size());
+            assertTrue(rows.stream().skip(1).allMatch(row -> row.startsWith("run-1,")));
+            assertFalse(rows.stream().anyMatch(row -> row.contains("functional-test-d218")));
+        }
+        assertTrue(kafka.closed());
+    }
+
+    @Test
+    void absentRunFilterPreservesMultiRunObservations() throws Exception {
+        var kafka = new TrackingConsumer();
+        var aggregator = new MeasurementAggregator();
+        var consumer = new MeasurementKafkaConsumer(kafka, aggregator, null);
+        var foreign = new SensorResult(RESULT.eventId(), "another-run", RESULT.deviceId(),
+                RESULT.eventTime(), RESULT.sentAt(), RESULT.ruleType(), false);
+        runRecords(consumer, kafka, resultRecord(0, foreign), resultRecord(1, RESULT));
+        assertEquals(2, aggregator.getUniqueResultCount());
+        assertEquals(0, consumer.getIgnoredForeignResults());
+    }
+
+    @Test
+    void blankRunFilterFailsBeforeClientCreation() {
+        assertThrows(IllegalArgumentException.class, () -> new MeasurementKafkaConsumer(
+                new Properties(), new MeasurementAggregator(), null, null, null, " "));
+    }
+
+    @Test
+    void missingRunIdentityFailsInsteadOfSilentlyFilteringUnknownData() throws Exception {
+        var kafka = new TrackingConsumer();
+        var aggregator = new MeasurementAggregator();
+        var consumer = new MeasurementKafkaConsumer(kafka, aggregator, null, null, null, System::nanoTime, "run-1");
+        var unknown = new SensorResult(RESULT.eventId(), null, RESULT.deviceId(), RESULT.eventTime(),
+                RESULT.sentAt(), RESULT.ruleType(), false);
+        var failure = assertThrows(IllegalStateException.class,
+                () -> runRecords(consumer, kafka, resultRecord(0, unknown)));
+        assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+        assertEquals(0, consumer.getIgnoredForeignResults());
+        assertEquals(0, aggregator.getReceivedResultCount());
+    }
+
     @SafeVarargs
     private static void runRecords(MeasurementKafkaConsumer consumer, TrackingConsumer kafka,
                                    ConsumerRecord<String, String>... records) {

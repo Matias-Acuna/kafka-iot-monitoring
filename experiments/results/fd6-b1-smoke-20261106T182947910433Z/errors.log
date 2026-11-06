@@ -1,0 +1,6 @@
+[consumer] SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+[consumer] SLF4J: Defaulting to no-operation (NOP) logger implementation
+[consumer] SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+[producer] SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+[producer] SLF4J: Defaulting to no-operation (NOP) logger implementation
+[producer] SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.

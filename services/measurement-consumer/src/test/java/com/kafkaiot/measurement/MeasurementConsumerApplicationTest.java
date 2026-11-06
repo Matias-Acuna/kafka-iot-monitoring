@@ -41,6 +41,81 @@ class MeasurementConsumerApplicationTest {
              "eventTime":1700000000000,"sentAt":1700000000100,"ruleType":"RAPID_CHANGE","triggered":true}
             """;
 
+    @Test
+    void readinessOptionIsExplicitAndValidated() throws Exception {
+        var parse = MeasurementConsumerApplication.class.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        for (String value : List.of("true", "false")) {
+            @SuppressWarnings("unchecked")
+            Map<String, String> options = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                    "--bootstrap-servers", "unused:9092", "--group-id", "g1", "--readiness-stdout", value});
+            assertEquals(value, options.get("readiness-stdout"));
+        }
+        var failure = assertThrows(InvocationTargetException.class,
+                () -> parse.invoke(null, (Object) new String[]{"--bootstrap-servers", "unused:9092",
+                        "--group-id", "g1", "--readiness-stdout", "yes"}));
+        assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+        assertThrows(IllegalArgumentException.class,
+                () -> MeasurementConsumerApplication.main(new String[]{"--readiness-stdout"}));
+    }
+
+    @Test
+    void readinessOutputIsOneJsonLineWithRequiredFields() throws Exception {
+        var original = System.out;
+        var bytes = new ByteArrayOutputStream();
+        try (var captured = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+            try {
+                System.setOut(captured);
+                MeasurementConsumerApplication.printReadiness(new MeasurementKafkaConsumer.ReadinessEvidence(
+                        "MEASUREMENT_CONSUMER_READINESS", 1700000000000L, "group-1", "READY", List.of(2),
+                        List.of(new MeasurementKafkaConsumer.PartitionPosition("sensor-results", 2, 42))));
+            } finally {
+                System.setOut(original);
+            }
+        }
+        assertEquals(1, bytes.toString(StandardCharsets.UTF_8).lines().count());
+        var json = new com.fasterxml.jackson.databind.ObjectMapper().readTree(bytes.toByteArray());
+        assertEquals("MEASUREMENT_CONSUMER_READINESS", json.path("evidenceType").textValue());
+        assertEquals(1700000000000L, json.path("observedAtEpochMs").longValue());
+        assertEquals("group-1", json.path("groupId").textValue());
+        assertEquals("READY", json.path("status").textValue());
+        assertEquals(42, json.path("assignedResultPartitions").get(0).path("startingPosition").longValue());
+    }
+
+    @Test
+    void pollingEvidenceUsesSameJsonInterfaceAndOutputFailuresAreExplicit() throws Exception {
+        var original = System.out;
+        var bytes = new ByteArrayOutputStream();
+        var poll = new MeasurementKafkaConsumer.PollEvidence(
+                "MEASUREMENT_CONSUMER_POLL_PROGRESS", 1700000000000L, "group-1", "NOT_READY",
+                3, 3, 0, true);
+        try (var captured = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+            try {
+                System.setOut(captured);
+                MeasurementConsumerApplication.printReadiness(poll);
+            } finally {
+                System.setOut(original);
+            }
+        }
+        var json = new com.fasterxml.jackson.databind.ObjectMapper().readTree(bytes.toByteArray());
+        assertEquals("MEASUREMENT_CONSUMER_POLL_PROGRESS", json.path("evidenceType").textValue());
+        assertEquals(3, json.path("successfulPolls").longValue());
+        assertTrue(json.path("lastPollEmpty").booleanValue());
+        try (var failed = new PrintStream(new java.io.OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("stdout unavailable");
+            }
+        })) {
+            try {
+                System.setOut(failed);
+                assertThrows(IllegalStateException.class, () -> MeasurementConsumerApplication.printReadiness(poll));
+            } finally {
+                System.setOut(original);
+            }
+        }
+    }
+
     @TempDir
     Path tempDir;
 
@@ -341,6 +416,101 @@ class MeasurementConsumerApplicationTest {
         return options;
     }
 
+    @Test
+    void csvClosureEvidenceFollowsActualCloseAndPrecedesCompletionSignal() throws Exception {
+        var options = options(true);
+        options.put("readiness-stdout", "true");
+        var completed = new CountDownLatch(1);
+        var supplied = new AtomicReference<SensorResultCsvWriter>();
+        var kafka = new MockConsumer<String, String>(OffsetResetStrategy.EARLIEST);
+        String output = captureOutput(() -> MeasurementConsumerApplication.execute(options,
+                (properties, aggregator, writer) -> {
+                    supplied.set(writer);
+                    var consumer = consumer(kafka, aggregator, writer);
+                    queue(kafka, consumer, JSON);
+                    return consumer;
+                }, completed));
+        assertThrows(IOException.class, () -> supplied.get().flush());
+        var event = csvClosure(output);
+        assertEquals("CLOSED", event.path("status").textValue());
+        assertTrue(event.path("observedAtEpochMs").longValue() > 0);
+        assertEquals(resultPath().toString(), event.path("outputPath").textValue());
+        assertEquals(0, completed.getCount());
+        assertEquals(2, Files.readAllLines(resultPath()).size());
+    }
+
+    @Test
+    void csvClosureFailureNeverReportsSuccessfulClosure() throws Exception {
+        var options = options(true);
+        options.put("readiness-stdout", "true");
+        var completed = new CountDownLatch(1);
+        var failure = new IOException("CSV close failed");
+        var kafka = new MockConsumer<String, String>(OffsetResetStrategy.EARLIEST);
+        String output = captureOutput(() -> {
+            var thrown = assertThrows(UncheckedIOException.class,
+                    () -> MeasurementConsumerApplication.execute(options, (properties, aggregator, writer) -> {
+                        failOnClose(writer, completed, failure);
+                        var consumer = consumer(kafka, aggregator, writer);
+                        consumer.shutdown();
+                        return consumer;
+                    }, completed));
+            assertSame(failure, thrown.getCause());
+        });
+        assertEquals("FAILED", csvClosure(output).path("status").textValue());
+        assertEquals("CSV close failed", csvClosure(output).path("failure").path("message").textValue());
+        assertFalse(output.contains("Measurement Consumer counts:"));
+        assertEquals(0, completed.getCount());
+    }
+
+    @Test
+    void csvWriteFailureCannotBecomeSuccessfulClosureEvidence() throws Exception {
+        var options = options(true);
+        options.put("readiness-stdout", "true");
+        var kafka = new MockConsumer<String, String>(OffsetResetStrategy.EARLIEST);
+        String output = captureOutput(() -> assertThrows(IllegalStateException.class,
+                () -> MeasurementConsumerApplication.execute(options, (properties, aggregator, writer) -> {
+                    try {
+                        writer.close();
+                    } catch (IOException exception) {
+                        throw new AssertionError(exception);
+                    }
+                    var consumer = consumer(kafka, aggregator, writer);
+                    queue(kafka, consumer, JSON);
+                    return consumer;
+                }, new CountDownLatch(1))));
+        assertEquals("CLOSED_WITH_WRITE_FAILURE", csvClosure(output).path("status").textValue());
+        assertTrue(csvClosure(output).path("failure").path("message").textValue().contains("Failed to write result CSV"));
+    }
+
+    @Test
+    void csvFailureEvidencePreservesOriginalAndSuppressedCleanupFailures() throws Exception {
+        var options = options(true);
+        options.put("readiness-stdout", "true");
+        var completed = new CountDownLatch(1);
+        var original = new IllegalStateException("startup failed");
+        var cleanup = new IOException("CSV cleanup failed");
+        String output = captureOutput(() -> {
+            assertSame(original, assertThrows(IllegalStateException.class,
+                    () -> MeasurementConsumerApplication.execute(options, (properties, aggregator, writer) -> {
+                        failOnClose(writer, completed, cleanup);
+                        throw original;
+                    }, completed)));
+        });
+        assertTrue(List.of(original.getSuppressed()).contains(cleanup));
+        assertEquals("FAILED", csvClosure(output).path("status").textValue());
+        assertEquals(0, completed.getCount());
+    }
+
+    private static com.fasterxml.jackson.databind.JsonNode csvClosure(String output) throws IOException {
+        for (String line : output.lines().filter(value -> value.startsWith("{")).toList()) {
+            var event = new com.fasterxml.jackson.databind.ObjectMapper().readTree(line);
+            if ("MEASUREMENT_CONSUMER_RESULT_CSV_CLOSED".equals(event.path("evidenceType").textValue())) {
+                return event;
+            }
+        }
+        throw new AssertionError("CSV closure evidence was not emitted");
+    }
+
     private Path resultPath() {
         return tempDir.resolve("run-1/sensor-results.csv");
     }
@@ -414,4 +584,182 @@ class MeasurementConsumerApplicationTest {
         }
         return output.toString(StandardCharsets.UTF_8);
     }
+    @Test
+    void configurationEvidenceContainsAppliedDefaultsAndCsvDestination() throws Exception {
+        var properties = com.kafkaiot.measurement.config.ConsumerKafkaConfig.createProperties("broker:9092", "group", "earliest");
+        var evidence = MeasurementConsumerApplication.configurationEvidence(properties,
+                Map.of("result-csv-output", "observations/sensor-results.csv"));
+        assertEquals("MEASUREMENT_CONSUMER_CONFIGURATION", evidence.evidenceType());
+        assertEquals("group", evidence.groupId());
+        assertTrue(evidence.observedAtEpochMs() > 0);
+        assertEquals(List.of("sensor-results", "sensor-alerts"), evidence.subscribedTopics());
+        var applied = evidence.appliedConfiguration();
+        assertEquals(List.of("broker:9092"), applied.get("bootstrap.servers"));
+        assertEquals("earliest", applied.get("auto.offset.reset"));
+        assertEquals(true, applied.get("enable.auto.commit"));
+        assertEquals(5000, applied.get("auto.commit.interval.ms"));
+        assertEquals(500, applied.get("max.poll.records"));
+        assertEquals(300000, applied.get("max.poll.interval.ms"));
+        assertEquals("classic", applied.get("group.protocol"));
+        assertEquals("read_uncommitted", applied.get("isolation.level"));
+        assertEquals("org.apache.kafka.common.serialization.StringDeserializer", applied.get("value.deserializer"));
+        assertTrue(evidence.resultCsvEnabled());
+        assertEquals(Path.of("observations/sensor-results.csv").toAbsolutePath().normalize().toString(), evidence.resultCsvOutput());
+        assertTrue(evidence.unavailable().contains("runtimeGeneratedClientId"));
+        var json = new com.fasterxml.jackson.databind.ObjectMapper().valueToTree(evidence);
+        assertFalse(json.has("status"));
+    }
+
+    @Test
+    void configurationEvidencePreservesLatestPolicyAndDisabledCsv() {
+        var properties = com.kafkaiot.measurement.config.ConsumerKafkaConfig.createProperties("broker:9092", "group", "latest");
+        var evidence = MeasurementConsumerApplication.configurationEvidence(properties, Map.of());
+        assertEquals("latest", evidence.appliedConfiguration().get("auto.offset.reset"));
+        assertFalse(evidence.resultCsvEnabled());
+        assertNull(evidence.resultCsvOutput());
+    }
+
+    @Test
+    void configurationEvidenceDoesNotLeakSecretsOrChangeProperties() throws Exception {
+        var properties = com.kafkaiot.measurement.config.ConsumerKafkaConfig.createProperties("broker:9092", "group", "earliest");
+        properties.setProperty("ssl.keystore.password", "private-secret");
+        properties.setProperty("custom.token", "private-token");
+        var original = properties.clone();
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(
+                MeasurementConsumerApplication.configurationEvidence(properties, Map.of()));
+        assertFalse(json.contains("private-secret"));
+        assertFalse(json.contains("private-token"));
+        assertFalse(json.contains("ssl.keystore.password"));
+        assertEquals(original, properties);
+    }
+
+    @Test
+    void configurationEvidenceDisabledDoesNotParseOrPrint() {
+        assertEquals("", captureOutput(() -> MeasurementConsumerApplication.emitConfiguration(null, Map.of())));
+        assertEquals("", captureOutput(() -> MeasurementConsumerApplication.emitConfiguration(null,
+                Map.of("readiness-stdout", "false"))));
+    }
+
+    @Test
+    void applicationEmitsOneConfigurationBeforeConsumerConstruction() throws Exception {
+        var options = options(false);
+        options.put("readiness-stdout", "true");
+        var completed = new CountDownLatch(1);
+        var kafka = new MockConsumer<String, String>(OffsetResetStrategy.EARLIEST);
+        String output = captureOutput(() -> MeasurementConsumerApplication.execute(options,
+                (properties, aggregator, writer) -> {
+                    var consumer = consumer(kafka, aggregator, writer);
+                    consumer.shutdown();
+                    return consumer;
+                }, completed));
+        var events = output.lines().filter(line -> line.startsWith("{")).toList();
+        assertEquals(1, events.size());
+        var json = new com.fasterxml.jackson.databind.ObjectMapper().readTree(events.getFirst());
+        assertEquals("MEASUREMENT_CONSUMER_CONFIGURATION", json.path("evidenceType").textValue());
+        assertEquals(0, completed.getCount());
+    }
+
+    @Test
+    void configurationOutputFailurePreventsConsumerCreationAndReleasesCompletion() {
+        var options = options(false);
+        options.put("readiness-stdout", "true");
+        var completed = new CountDownLatch(1);
+        var original = System.out;
+        try (var broken = new PrintStream(new java.io.OutputStream() {
+            @Override public void write(int value) throws IOException { throw new IOException("stdout failed"); }
+        })) {
+            try {
+                System.setOut(broken);
+                assertThrows(IllegalStateException.class, () -> MeasurementConsumerApplication.execute(options,
+                        (properties, aggregator, writer) -> { throw new AssertionError("must not construct consumer"); }, completed));
+            } finally {
+                System.setOut(original);
+            }
+        }
+        assertEquals(0, completed.getCount());
+    }
+
+    @Test
+    void configurationSerializerFailureUsesExistingExplicitErrorPath() {
+        var failure = assertThrows(IllegalStateException.class, () -> MeasurementConsumerApplication.printReadiness(new Object() {
+            public String getValue() { throw new IllegalStateException("cannot serialize"); }
+        }));
+        assertTrue(failure.getMessage().contains("serialized"));
+        assertTrue(failure.getCause() instanceof com.fasterxml.jackson.core.JsonProcessingException);
+    }
+    @Test
+    void optionalRunIsolationIsValidatedAndIncludedInConfigurationEvidence() throws Exception {
+        var parse = MeasurementConsumerApplication.class.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        var parsed = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group", "--run-id", "run-1"});
+        var properties = com.kafkaiot.measurement.config.ConsumerKafkaConfig.createProperties("broker:9092", "group", "earliest");
+        assertEquals("run-1", MeasurementConsumerApplication.configurationEvidence(properties, parsed).runIdFilter());
+        assertNull(MeasurementConsumerApplication.configurationEvidence(properties, Map.of()).runIdFilter());
+        var failure = assertThrows(InvocationTargetException.class, () -> parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group", "--run-id", " "}));
+        assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+    }
+    @Test
+    void dashboardPortIsOptionalAndStrictlyValidated() throws Exception {
+        var parse = MeasurementConsumerApplication.class.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        var defaults = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group"});
+        assertFalse(defaults.containsKey("dashboard-port"));
+        @SuppressWarnings("unchecked")
+        var configured = (Map<String, String>) parse.invoke(null, (Object) new String[]{
+                "--bootstrap-servers", "broker:9092", "--group-id", "group", "--dashboard-port", "8080"});
+        assertEquals("8080", configured.get("dashboard-port"));
+        for (String port : List.of("0", "-1", "65536", "2147483648", "text")) {
+            var failure = assertThrows(InvocationTargetException.class, () -> parse.invoke(null, (Object) new String[]{
+                    "--bootstrap-servers", "broker:9092", "--group-id", "group", "--dashboard-port", port}));
+            assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+        }
+    }
+
+    @Test
+    void applicationOwnsHttpClosureBeforeSignallingCompletion() throws Exception {
+        int port;
+        try (var reservation = new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
+            port = reservation.getLocalPort();
+        }
+        var options = options(false);
+        options.put("dashboard-port", Integer.toString(port));
+        var completed = new CountDownLatch(1);
+        var kafka = new MockConsumer<String, String>(OffsetResetStrategy.EARLIEST);
+        try (var client = java.net.http.HttpClient.newHttpClient()) {
+            var request = java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://127.0.0.1:" + port + "/metrics/dashboard"))
+                    .timeout(java.time.Duration.ofSeconds(3)).GET().build();
+            captureOutput(() -> MeasurementConsumerApplication.execute(options, (properties, aggregator, writer) -> {
+                try {
+                    assertEquals(200, client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode());
+                } catch (IOException | InterruptedException failure) {
+                    throw new AssertionError(failure);
+                }
+                var consumer = consumer(kafka, aggregator, writer);
+                consumer.shutdown();
+                return consumer;
+            }, completed));
+            assertEquals(0, completed.getCount());
+            assertThrows(IOException.class, () -> client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString()));
+        }
+    }
+
+    @Test
+    void dashboardBindFailureIsNotClassifiedAsCsvFailure() throws Exception {
+        try (var reservation = new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
+            var options = options(false);
+            options.put("dashboard-port", Integer.toString(reservation.getLocalPort()));
+            var completed = new CountDownLatch(1);
+            var failure = assertThrows(UncheckedIOException.class, () -> MeasurementConsumerApplication.execute(options,
+                    (properties, aggregator, writer) -> { throw new AssertionError("Consumer must not be created after HTTP bind failure"); }, completed));
+            assertTrue(failure.getMessage().contains("Dashboard HTTP startup"));
+            assertFalse(captureErrors(() -> MeasurementConsumerApplication.reportFailure(failure)).contains("Result CSV file-writing"));
+            assertEquals(0, completed.getCount());
+        }
+    }
+
 }

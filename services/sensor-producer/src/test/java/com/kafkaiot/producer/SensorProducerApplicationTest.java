@@ -481,6 +481,101 @@ class SensorProducerApplicationTest {
                 Files.readAllBytes(output.resolveSibling("before-failure.json"))).path("experimentStatus").textValue());
     }
 
+    @Test
+    void timingStdoutOptionParsesAndRejectsInvalidValuesBeforePublisherCreation() throws Exception {
+        var options = options();
+        options.put("timing-stdout", "true");
+        assertEquals(options, parse(arguments(options)));
+        options.put("timing-stdout", "invalid");
+        assertThrows(IllegalArgumentException.class, () -> SensorProducerApplication.execute(options,
+                (bootstrap, acks, idempotence) -> { throw new AssertionError("must not start"); }));
+        assertThrows(IllegalArgumentException.class,
+                () -> SensorProducerApplication.main(new String[]{"--timing-stdout"}));
+    }
+
+    @Test
+    void enabledTimingIsOneEventAndMatchesPersistedActualAnchorAndBoundaries() throws Exception {
+        var options = metadataOptions();
+        options.put("timing-stdout", "true");
+        var kafka = new MockProducer<String, String>(true, null, new StringSerializer(), new StringSerializer());
+        var publisher = publisher(kafka);
+        String output = captureTimingOutput(options, (bootstrap, acks, idempotence) -> publisher);
+        List<String> lines = output.lines().filter(line -> line.startsWith("{")).toList();
+        assertEquals(1, lines.size());
+        var evidence = new ObjectMapper().readTree(lines.getFirst());
+        var metadata = metadata(options);
+        assertEquals("PRODUCER_WORKLOAD_TIMING", evidence.path("evidenceType").textValue());
+        assertEquals("run-1", evidence.path("runId").textValue());
+        for (String field : List.of("workloadStartNs", "workloadStartEpochMs", "sampleSpanNs")) {
+            assertEquals(metadata.path("clockAnchors").path(field), evidence.path(field));
+        }
+        assertEquals(0, evidence.path("warmUpDurationNs").longValue());
+        assertEquals(1_000_000_000L, evidence.path("measurementDurationNs").longValue());
+        assertEquals(evidence.path("workloadStartEpochMs"), evidence.path("measurementStartEpochMs"));
+        assertEquals(metadata.path("scheduled").path("measurementDeadlineEpochMs"),
+                evidence.path("measurementDeadlineEpochMs"));
+        assertTrue(output.indexOf("PRODUCER_WORKLOAD_TIMING") < output.indexOf("Final CSV exported"));
+        assertTrue(kafka.closed());
+    }
+
+    @Test
+    void timingEvidenceDisabledPreservesExistingOutputAndPublication() throws Exception {
+        var options = options();
+        options.put("timing-stdout", "false");
+        var kafka = new MockProducer<String, String>(true, null, new StringSerializer(), new StringSerializer());
+        var publisher = publisher(kafka);
+        String output = captureTimingOutput(options, (bootstrap, acks, idempotence) -> publisher);
+        assertFalse(output.contains("PRODUCER_WORKLOAD_TIMING"));
+        assertTrue(output.contains("Final CSV exported"));
+        assertTrue(kafka.closed());
+    }
+
+    @Test
+    void timingStdoutFailureStopsBeforePublicationAndPreservesCleanupFailure() throws Exception {
+        var options = metadataOptions();
+        options.put("timing-stdout", "true");
+        var kafka = new MockProducer<String, String>(true, null, new StringSerializer(), new StringSerializer());
+        var closeFailure = new IllegalStateException("mock close failed");
+        kafka.closeException = closeFailure;
+        var publisher = publisher(kafka);
+        PrintStream original = System.out;
+        try (var broken = new PrintStream(new java.io.OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("stdout failed");
+            }
+        })) {
+            try {
+                System.setOut(broken);
+                var failure = assertThrows(IllegalStateException.class,
+                        () -> SensorProducerApplication.execute(options, (bootstrap, acks, idempotence) -> publisher));
+                assertTrue(failure.getMessage().contains("Producer timing evidence stdout"));
+                assertTrue(List.of(failure.getSuppressed()).contains(closeFailure));
+            } finally {
+                System.setOut(original);
+            }
+        }
+        assertTrue(kafka.history().isEmpty());
+        assertFalse(Files.exists(Path.of(options.get("csv-output"))));
+        assertEquals("FAILED", metadata(options).path("components").path("producer").textValue());
+        assertEquals("NOT_FINALIZED", metadata(options).path("experimentStatus").textValue());
+    }
+
+    private static String captureTimingOutput(Map<String, String> options,
+                                              SensorProducerApplication.PublisherFactory factory) throws Exception {
+        PrintStream original = System.out;
+        var bytes = new ByteArrayOutputStream();
+        try (var output = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+            try {
+                System.setOut(output);
+                SensorProducerApplication.execute(options, factory);
+            } finally {
+                System.setOut(original);
+            }
+        }
+        return bytes.toString(StandardCharsets.UTF_8);
+    }
+
     private Map<String, String> metadataOptions() throws Exception {
         Map<String, String> options = options();
         options.put("run-config-output", tempDir.resolve("run-1/run-config.json").toString());

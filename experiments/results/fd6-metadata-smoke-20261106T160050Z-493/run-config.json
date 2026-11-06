@@ -1,0 +1,65 @@
+{
+  "schemaVersion" : 1,
+  "runId" : "fd6-metadata-smoke-20261106T160050Z-493",
+  "configuration" : {
+    "producer" : {
+      "runId" : "fd6-metadata-smoke-20261106T160050Z-493",
+      "randomSeed" : 123,
+      "initialEventTimestamp" : 1700000000000,
+      "timestampIncrementMs" : 1,
+      "targetEventsPerSecond" : 10.0,
+      "csvOutput" : "/app/results/producer-totals.csv",
+      "eventCsvOutput" : "/app/results/producer-events.csv",
+      "runConfigOutput" : "/app/results/run-config.json",
+      "kafkaSettings" : {
+        "compression.type" : "none",
+        "value.serializer" : "org.apache.kafka.common.serialization.StringSerializer",
+        "enable.idempotence" : "true",
+        "acks" : "all",
+        "batch.size" : "16384",
+        "bootstrap.servers" : "broker-1:19092,broker-2:19092,broker-3:19092",
+        "max.in.flight.requests.per.connection" : "1",
+        "key.serializer" : "org.apache.kafka.common.serialization.StringSerializer",
+        "linger.ms" : "5"
+      }
+    },
+    "streams" : null,
+    "consumer" : null
+  },
+  "phaseDurationsMs" : {
+    "warmUp" : 0,
+    "measurement" : 3000,
+    "maximumDrain" : null,
+    "warmUpDurationNs" : 0,
+    "measurementDurationNs" : 3000000000
+  },
+  "clockAnchors" : {
+    "workloadStartNs" : 32037095615070,
+    "workloadStartEpochMs" : 1793980941174,
+    "sampleSpanNs" : 944
+  },
+  "scheduled" : {
+    "measurementStartOffsetNs" : 0,
+    "measurementDeadlineOffsetNs" : 3000000000,
+    "measurementStartEpochMs" : 1793980941174,
+    "measurementDeadlineEpochMs" : 1793980944174,
+    "epochAlignment" : "DERIVED_FROM_BRACKETED_CLOCK_SAMPLE"
+  },
+  "observed" : {
+    "generationStoppedElapsedNs" : 3000256194,
+    "generationStoppedEpochMs" : 1793980944175,
+    "publicationsDrainedEpochMs" : 1793980944203,
+    "eventCsvClosedEpochMs" : 1793980944221,
+    "producerCleanupCompletedEpochMs" : 1793980944246,
+    "drainEndedEpochMs" : null,
+    "beforeWorkloadEpochMs" : 1793980940944,
+    "generationSnapshotRecordedEpochMs" : 1793980944175
+  },
+  "components" : {
+    "producer" : "COMPLETED",
+    "consumer" : "NOT_RECORDED",
+    "producerLifecycle" : "COMPLETED"
+  },
+  "experimentStatus" : "NOT_FINALIZED",
+  "failures" : [ ]
+}

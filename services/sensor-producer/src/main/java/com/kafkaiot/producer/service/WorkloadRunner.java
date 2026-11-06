@@ -67,6 +67,15 @@ public final class WorkloadRunner {
         public long measurementDeadlineOffsetNs() {
             return warmUpDurationNs + measurementDurationNs;
         }
+
+        /** Epoch boundaries derive from the bracketed sample, with sampleSpanNs uncertainty. */
+        public long measurementStartEpochMs() {
+            return Math.addExact(workloadStartEpochMs, measurementStartOffsetNs() / 1_000_000L);
+        }
+
+        public long measurementDeadlineEpochMs() {
+            return Math.addExact(workloadStartEpochMs, measurementDeadlineOffsetNs() / 1_000_000L);
+        }
     }
 
     public WorkloadRunner(SensorEventGenerator generator,
@@ -129,6 +138,13 @@ public final class WorkloadRunner {
      */
     public void run(BeforePublishCallback beforePublish, PublicationCallback completionCallback,
                     ProducerEventCsvWriter writer) throws InterruptedException {
+        run(beforePublish, completionCallback, writer, null);
+    }
+
+    /** Invokes the optional observer once after sampling, before generation; its time counts toward the deadline. */
+    public void run(BeforePublishCallback beforePublish, PublicationCallback completionCallback,
+                    ProducerEventCsvWriter writer, java.util.function.Consumer<Timing> timingObserver)
+            throws InterruptedException {
         Objects.requireNonNull(beforePublish, "beforePublish");
         Objects.requireNonNull(completionCallback, "completionCallback");
         long n0 = System.nanoTime();
@@ -139,6 +155,9 @@ public final class WorkloadRunner {
         try {
             timing = new Timing(n0, epochMs, n1 - n0, warmUpNanos, totalNanos - warmUpNanos,
                     null, null);
+            if (timingObserver != null) {
+                timingObserver.accept(timing);
+            }
             while (true) {
                 if (Thread.currentThread().isInterrupted()) {
                     throw new InterruptedException("Workload interrupted");

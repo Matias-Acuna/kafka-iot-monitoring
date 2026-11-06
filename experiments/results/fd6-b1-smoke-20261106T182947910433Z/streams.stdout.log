@@ -1,0 +1,41 @@
+[[1;34mINFO[m] Scanning for projects...
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--------------------< [0;36mcom.kafka.iot:kafka-streams[0;1m >---------------------[m
+[[1;34mINFO[m] [1mBuilding kafka-streams 1.0-SNAPSHOT[m
+[[1;34mINFO[m]   from pom.xml
+[[1;34mINFO[m] [1m--------------------------------[ jar ]---------------------------------[m
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mresources:3.3.1:resources[m [1m(default-resources)[m @ [36mkafka-streams[0;1m ---[m
+[[1;34mINFO[m] Copying 1 resource from src/main/resources to target/classes
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mcompiler:3.14.1:compile[m [1m(default-compile)[m @ [36mkafka-streams[0;1m ---[m
+[[1;34mINFO[m] Recompiling the module because of [1madded or removed source files[m.
+[[1;34mINFO[m] Compiling 11 source files with javac [debug release 21] to target/classes
+[[1;34mINFO[m] 
+[[1;34mINFO[m] [1m--- [0;32mdependency:3.7.0:copy-dependencies[m [1m(default-cli)[m @ [36mkafka-streams[0;1m ---[m
+[[1;34mINFO[m] Copying artifact 'org.apache.kafka:kafka-streams:jar:4.1.2:compile' (/home/matias/.m2/repository/org/apache/kafka/kafka-streams/4.1.2/kafka-streams-4.1.2.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/kafka-streams-4.1.2.jar
+[[1;34mINFO[m] Copying artifact 'org.apache.kafka:kafka-clients:jar:4.1.2:compile' (/home/matias/.m2/repository/org/apache/kafka/kafka-clients/4.1.2/kafka-clients-4.1.2.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/kafka-clients-4.1.2.jar
+[[1;34mINFO[m] Copying artifact 'org.rocksdb:rocksdbjni:jar:9.7.3:compile' (/home/matias/.m2/repository/org/rocksdb/rocksdbjni/9.7.3/rocksdbjni-9.7.3.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/rocksdbjni-9.7.3.jar
+[[1;34mINFO[m] Copying artifact 'com.fasterxml.jackson.core:jackson-annotations:jar:2.19.4:compile' (/home/matias/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.19.4/jackson-annotations-2.19.4.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/jackson-annotations-2.19.4.jar
+[[1;34mINFO[m] Copying artifact 'org.slf4j:slf4j-api:jar:1.7.36:runtime' (/home/matias/.m2/repository/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/slf4j-api-1.7.36.jar
+[[1;34mINFO[m] Copying artifact 'com.fasterxml.jackson.core:jackson-databind:jar:2.19.4:compile' (/home/matias/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.19.4/jackson-databind-2.19.4.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/jackson-databind-2.19.4.jar
+[[1;34mINFO[m] Copying artifact 'com.fasterxml.jackson.core:jackson-core:jar:2.19.4:compile' (/home/matias/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.19.4/jackson-core-2.19.4.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/jackson-core-2.19.4.jar
+[[1;34mINFO[m] Copying artifact 'org.slf4j:slf4j-simple:jar:1.7.36:runtime' (/home/matias/.m2/repository/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar) to /mnt/c/Users/Yozora/Documents/Personal/tesis/tesis-kafka/kafka-iot-monitoring/services/kafka-streams/target/dependency/slf4j-simple-1.7.36.jar
+[[1;34mINFO[m] com.github.luben:zstd-jni:jar:1.5.6-10 already exists in destination.
+[[1;34mINFO[m] at.yawk.lz4:lz4-java:jar:1.10.1 already exists in destination.
+[[1;34mINFO[m] org.xerial.snappy:snappy-java:jar:1.1.10.7 already exists in destination.
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] [1;32mBUILD SUCCESS[m
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+[[1;34mINFO[m] Total time:  5.174 s
+[[1;34mINFO[m] Finished at: 2026-11-06T19:30:53+01:00
+[[1;34mINFO[m] [1m------------------------------------------------------------------------[m
+{"evidenceType":"KAFKA_STREAMS_CONFIGURATION","observedAtEpochMs":1793989854640,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","rule":"HIGH_TEMPERATURE","ruleParameters":{"temperatureThreshold":30.0},"appliedConfiguration":{"application.id":"fd6-b1-smoke-20261106T182947910433Z-streams","bootstrap.servers":["localhost:29092","localhost:39092","localhost:49092"],"processing.guarantee":"at_least_once","num.stream.threads":1,"default.key.serde":"org.apache.kafka.common.serialization.Serdes$StringSerde","default.value.serde":"org.apache.kafka.common.serialization.Serdes$StringSerde","state.dir":"/tmp/kafka-streams","commit.interval.ms":30000,"num.standby.replicas":0,"replication.factor":-1,"topology.optimization":"none","statestore.cache.max.bytes":10485760,"max.task.idle.ms":0,"security.protocol":"PLAINTEXT","default.timestamp.extractor":"org.apache.kafka.streams.processor.FailOnInvalidTimestamp"},"unavailable":["runtimeGeneratedClientIds","brokerEffectiveTopicConfiguration"]}
+{"evidenceType":"KAFKA_STREAMS_STARTUP","observedAtEpochMs":1793989855840,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"CREATED","currentState":"CREATED","status":"NOT_READY","failure":null}
+{"evidenceType":"KAFKA_STREAMS_STATE_CHANGED","observedAtEpochMs":1793989855858,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"CREATED","currentState":"REBALANCING","status":"NOT_READY","failure":null}
+Kafka Streams start requested for applicationId=fd6-b1-smoke-20261106T182947910433Z-streams, rule=HIGH_TEMPERATURE, temperatureThreshold=30.0
+{"evidenceType":"KAFKA_STREAMS_STATE_CHANGED","observedAtEpochMs":1793989860054,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"REBALANCING","currentState":"RUNNING","status":"READY","failure":null}
+{"evidenceType":"KAFKA_STREAMS_SHUTDOWN_REQUESTED","observedAtEpochMs":1793990346950,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"RUNNING","currentState":"RUNNING","status":"SHUTDOWN_REQUESTED","failure":null}
+{"evidenceType":"KAFKA_STREAMS_STATE_CHANGED","observedAtEpochMs":1793990346952,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"RUNNING","currentState":"PENDING_SHUTDOWN","status":"NOT_READY","failure":null}
+{"evidenceType":"KAFKA_STREAMS_CLOSE_RESULT","observedAtEpochMs":1793990347478,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"RUNNING","currentState":"NOT_RUNNING","status":"CLOSED","failure":null}
+{"evidenceType":"KAFKA_STREAMS_STATE_CHANGED","observedAtEpochMs":1793990347478,"applicationId":"fd6-b1-smoke-20261106T182947910433Z-streams","previousState":"PENDING_SHUTDOWN","currentState":"NOT_RUNNING","status":"NOT_READY","failure":null}

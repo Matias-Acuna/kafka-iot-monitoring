@@ -359,6 +359,58 @@ class WorkloadRunnerTest {
         }
     }
 
+    @Test
+    void timingObserverReceivesActualInitialSnapshotExactlyOnceBeforeGeneration() {
+        var kafka = mock(true);
+        var stop = new IllegalStateException("stop at timing observer");
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            var runner = new WorkloadRunner(new SensorEventGenerator("run-1", 123, 0, 1),
+                    publisher, 10, 60, 300);
+            var calls = new AtomicInteger();
+            var initial = new java.util.concurrent.atomic.AtomicReference<WorkloadRunner.Timing>();
+            assertSame(stop, assertThrows(IllegalStateException.class, () -> runner.run(
+                    (phase, event) -> { throw new AssertionError("must not generate"); },
+                    (phase, event, metadata, exception) -> { }, null, timing -> {
+                        calls.incrementAndGet();
+                        assertSame(runner.getTiming(), timing);
+                        initial.set(timing);
+                        assertTrue(timing.sampleSpanNs() >= 0);
+                        assertEquals(timing.workloadStartEpochMs() + 60_000, timing.measurementStartEpochMs());
+                        assertEquals(timing.workloadStartEpochMs() + 360_000, timing.measurementDeadlineEpochMs());
+                        throw stop;
+                    })));
+            assertEquals(1, calls.get());
+            assertTrue(kafka.history().isEmpty());
+            assertEquals(initial.get().workloadStartNs(), runner.getTiming().workloadStartNs());
+            assertEquals(initial.get().sampleSpanNs(), runner.getTiming().sampleSpanNs());
+            assertNotNull(runner.getTiming().generationStoppedElapsedNs());
+        }
+    }
+
+    @Test
+    void delayedTimingObserverDoesNotMoveDeadlineOrGenerateCatchUpEvents() throws InterruptedException {
+        var kafka = mock(true);
+        try (var publisher = new SensorEventPublisher(kafka)) {
+            var runner = new WorkloadRunner(new SensorEventGenerator("run-1", 123, 0, 1),
+                    publisher, 10, 0, 1);
+            var calls = new AtomicInteger();
+            runner.run((phase, event) -> { throw new AssertionError("deadline already passed"); },
+                    (phase, event, metadata, exception) -> { }, null, timing -> {
+                        calls.incrementAndGet();
+                        assertEquals(timing.workloadStartEpochMs(), timing.measurementStartEpochMs());
+                        assertEquals(timing.workloadStartEpochMs() + 1000, timing.measurementDeadlineEpochMs());
+                        long delayStart = System.nanoTime();
+                        while (System.nanoTime() - delayStart < 1_100_000_000L) {
+                            LockSupport.parkNanos(1_100_000_000L - (System.nanoTime() - delayStart));
+                        }
+                    });
+            assertEquals(1, calls.get());
+            assertTrue(kafka.history().isEmpty());
+            assertEquals(1_000_000_000L, runner.getTiming().measurementDeadlineOffsetNs());
+            assertTrue(runner.getTiming().generationStoppedElapsedNs() >= 1_100_000_000L);
+        }
+    }
+
     private static WorkloadRunner runner(SensorEventPublisher publisher, long warmUpSeconds) {
         return new WorkloadRunner(new SensorEventGenerator("run-1", 123, 1_600_000_000_000L, 1),
                 publisher, 1_000_000, warmUpSeconds, 1);

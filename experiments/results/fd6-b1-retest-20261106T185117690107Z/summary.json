@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "reportStatus": "COMPLETE",
+  "runId": "fd6-b1-retest-20261106T185117690107Z",
+  "scenario": "B1",
+  "experimentStatus": "FINALIZED",
+  "measurementInterval": {
+    "startEpochMs": 1793991246658,
+    "deadlineEpochMs": 1793991546658,
+    "bounds": "[start, deadline)",
+    "durationSeconds": 300
+  },
+  "observationCutoffEpochMs": 1793991666658,
+  "cutoffInclusive": true,
+  "populations": {
+    "throughput": "Original MEASUREMENT events; each observation inside [measurementStart, measurementDeadline); earliest observation per identity/status; zero bins included.",
+    "latencyAndReliability": "Original MEASUREMENT events; observations at or before the drain cutoff; earliest result per (runId,eventId) for latency; all eligible deliveries for duplicate counts.",
+    "latencyPercentiles": "Type 7 over nonnegative unique latencies, resultReceivedAt - sentAt; negative observations preserved separately.",
+    "reliability": "Confirmed events without observed results after verified operational coverage are observed absences, not proven Kafka data loss."
+  },
+  "units": {
+    "throughput": "events/s",
+    "latency": "ms",
+    "timestamps": "Unix epoch ms"
+  },
+  "operationalCoverage": {
+    "status": "COMPLETE",
+    "definition": "BOUNDED_POLL_REPORT_CONTINUITY",
+    "observedFromEpochMs": 1793991172239,
+    "pollingTerminatedEpochMs": 1793991666661,
+    "requiredCutoffEpochMs": 1793991666658,
+    "reportingCadenceMs": 1000,
+    "pollTimeoutMs": 1000,
+    "schedulingGraceMs": 0,
+    "timestampGranularityToleranceMs": 1,
+    "maximumReportingGapMs": 2001,
+    "pollProgressRecords": 463,
+    "limitation": "Bounded operational reporting only; pauses up to the reporting bound and individual missing results remain possible."
+  },
+  "throughput": {
+    "attempted": {
+      "total": 3000,
+      "meanEventsPerSecond": 10.0,
+      "minimumEventsPerSecond": 10,
+      "maximumEventsPerSecond": 10
+    },
+    "confirmed": {
+      "total": 3000,
+      "meanEventsPerSecond": 10.0,
+      "minimumEventsPerSecond": 10,
+      "maximumEventsPerSecond": 10
+    },
+    "uniqueResults": {
+      "total": 2999,
+      "meanEventsPerSecond": 9.996666666666666,
+      "minimumEventsPerSecond": 9,
+      "maximumEventsPerSecond": 11
+    }
+  },
+  "latency": {
+    "uniqueResults": 3000,
+    "validLatencyObservations": 3000,
+    "negativeLatencyObservations": 0,
+    "duplicateResultObservations": 0,
+    "p50Ms": 108.0,
+    "p95Ms": 111.0,
+    "p99Ms": 112.0,
+    "negativeLatencies": []
+  },
+  "reliability": {
+    "runId": "fd6-b1-retest-20261106T185117690107Z",
+    "uniqueAttemptedEvents": 3000,
+    "uniqueConfirmedEvents": 3000,
+    "failedPublicationOutcomes": 0,
+    "attemptsWithoutRecordedOutcome": 0,
+    "uniqueConsumerResults": 3000,
+    "duplicateConsumerResultObservations": 0,
+    "provisionalMissingResultCount": 0,
+    "provisionalMissingResultCandidates": [],
+    "definitiveMissingResultCount": null,
+    "publicationErrors": [],
+    "anomalies": [],
+    "confirmedEventsWithoutObservedResultAfterCutoff": 0,
+    "provenKafkaDataLossCount": null
+  }
+}

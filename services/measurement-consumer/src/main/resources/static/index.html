@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Live operational observations from the Kafka IoT Measurement Consumer.">
+  <title>Kafka IoT Monitoring</title>
+  <link rel="stylesheet" href="dashboard.css">
+  <script src="vendor/chart.umd.min.js" defer></script>
+  <script src="dashboard.js" defer></script>
+</head>
+<body data-connection="waiting">
+  <aside class="sidebar" aria-label="Dashboard navigation">
+    <a class="brand" href="#overview" aria-label="Kafka IoT Monitoring home">
+      <span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="m9 9 14 7M9 23l14-7M9 9v14" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="7" r="4"/><circle cx="9" cy="25" r="4"/><circle cx="25" cy="16" r="4"/></svg></span>
+      <span>kafka<span class="brand-light"> / iot</span><small>MONITORING WORKSPACE</small></span>
+    </a>
+    <p class="nav-label">WORKSPACE</p>
+    <nav>
+      <a class="nav-link nav-current" href="#overview" aria-current="page"><span aria-hidden="true">◫</span> Overview <span class="nav-dot" aria-hidden="true"></span></a>
+      <a class="nav-link" href="#charts"><span aria-hidden="true">⌁</span> Performance</a>
+      <a class="nav-link" href="#alerts"><span aria-hidden="true">◇</span> Alerts by rule</a>
+      <a class="nav-link" href="#run-information"><span aria-hidden="true">▤</span> Run information</a>
+    </nav>
+    <div class="sidebar-note"><span class="small-dot" aria-hidden="true"></span><strong>Measurement Consumer</strong><p>Live operational observations.<br>Scientific results stay in CSV / JSON.</p><span class="local-label">LOCAL DASHBOARD</span></div>
+  </aside>
+
+  <main id="overview">
+    <header class="page-header">
+      <div><div class="eyebrow"><span class="small-dot" aria-hidden="true"></span> EVENT STREAMING / OVERVIEW</div><h1>Kafka IoT Monitoring</h1><p class="subtitle">Real-Time Event Streaming Dashboard</p></div>
+      <div class="header-status"><span class="status-badge" id="connection-badge"><span class="status-dot" aria-hidden="true"></span><span id="connection-text">Waiting for data</span></span><span class="refresh-label">Last successful update <time id="last-success">N/A</time></span></div>
+    </header>
+
+    <section class="observation-banner" aria-label="Observation status">
+      <div class="banner-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M3 12h4l3-7 4 14 3-7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="banner-copy"><h2 id="feed-title">Your stream, at a glance</h2><p id="feed-message" role="status" aria-live="polite">Waiting for the first metrics response. Unavailable observations are shown as N/A.</p><p class="health-note">Connection refers to the metrics endpoint. Kafka health is not verified here.</p></div>
+      <button id="refresh-button" class="refresh-button" type="button"><span aria-hidden="true">↻</span> Refresh</button>
+    </section>
+
+    <div class="section-heading"><h2>Stream overview</h2><span class="run-pill">RUN <span id="header-run">N/A</span></span></div>
+    <section class="kpi-grid" aria-label="Live metrics">
+      <article class="kpi-card"><div class="kpi-top"><h3>Total Received Results</h3><span class="metric-icon blue" aria-hidden="true">↓</span></div><p class="metric-value" id="total-results">N/A</p><p class="metric-note">All received result deliveries</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>Unique Processed Results</h3><span class="metric-icon green" aria-hidden="true">✓</span></div><p class="metric-value" id="unique-results">N/A</p><p class="metric-note">Unique run and event identities</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>Duplicate Result Deliveries</h3><span class="metric-icon violet" aria-hidden="true">⧉</span></div><p class="metric-value" id="duplicate-results">N/A</p><p class="metric-note">Repeated result observations</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>Total Received Alerts</h3><span class="metric-icon amber" aria-hidden="true">◇</span></div><p class="metric-value" id="total-alerts">N/A</p><p class="metric-note">Alert deliveries received</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>Results Throughput</h3><span class="metric-icon blue" aria-hidden="true">⌁</span></div><p class="metric-value"><span id="result-throughput">N/A</span><span class="unit">results/s</span></p><p class="metric-note">Live rate supplied by the backend</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>E2E Latency P50</h3><span class="percentile-tag blue">P50</span></div><p class="metric-value"><span id="latency-p50">N/A</span><span class="unit">ms</span></p><p class="metric-note">Backend latency percentile</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>E2E Latency P95</h3><span class="percentile-tag cyan">P95</span></div><p class="metric-value"><span id="latency-p95">N/A</span><span class="unit">ms</span></p><p class="metric-note">Backend latency percentile</p></article>
+      <article class="kpi-card"><div class="kpi-top"><h3>E2E Latency P99</h3><span class="percentile-tag violet">P99</span></div><p class="metric-value"><span id="latency-p99">N/A</span><span class="unit">ms</span></p><p class="metric-note">Backend latency percentile</p></article>
+    </section>
+
+    <section id="charts" class="charts-grid" aria-label="Performance charts">
+      <article class="panel chart-panel"><div class="panel-header"><div><h2>Results Throughput</h2><p>Received results over time</p></div><span class="chart-unit">RESULTS / SECOND</span></div><div class="chart-wrap"><canvas id="throughput-chart" role="img" aria-label="Results throughput over time in results per second"></canvas><div id="throughput-empty" class="chart-empty"><span class="empty-chart-icon" aria-hidden="true">⌁</span><strong>Waiting for throughput data</strong><span>Only real backend samples appear here.</span></div></div><div class="chart-footer"><span><i class="legend-dot blue-dot" aria-hidden="true"></i> Results throughput</span><span>Time in UTC</span></div></article>
+      <article class="panel chart-panel"><div class="panel-header"><div><h2>End-to-End Latency</h2><p>Backend-supplied latency percentiles</p></div><span class="chart-unit">MILLISECONDS</span></div><div class="chart-wrap"><canvas id="latency-chart" role="img" aria-label="End-to-end latency P50, P95 and P99 over time in milliseconds"></canvas><div id="latency-empty" class="chart-empty"><span class="empty-chart-icon" aria-hidden="true">⌁</span><strong>Waiting for latency data</strong><span>Percentiles are never estimated in the browser.</span></div></div><div class="chart-footer"><span><i class="legend-dot blue-dot" aria-hidden="true"></i> P50 <i class="legend-dot cyan-dot" aria-hidden="true"></i> P95 <i class="legend-dot violet-dot" aria-hidden="true"></i> P99</span><span>Time in UTC</span></div></article>
+    </section>
+
+    <div class="details-grid">
+      <section id="alerts" class="panel"><div class="panel-header"><div><h2>Alerts by rule</h2><p>Counts from received alert observations</p></div><span class="subtle-label">LIVE COUNTS</span></div><div class="rule-list"><div class="rule-row"><span class="rule-marker temperature" aria-hidden="true">↑</span><div><h3>HIGH_TEMPERATURE</h3><p>Temperature threshold</p></div><span class="rule-count" id="alerts-temperature">N/A</span></div><div class="rule-row"><span class="rule-marker frequency" aria-hidden="true">⌁</span><div><h3>HIGH_FREQUENCY</h3><p>Event frequency</p></div><span class="rule-count" id="alerts-frequency">N/A</span></div><div class="rule-row"><span class="rule-marker change" aria-hidden="true">↗</span><div><h3>RAPID_CHANGE</h3><p>Temperature change</p></div><span class="rule-count" id="alerts-change">N/A</span></div></div></section>
+      <section id="run-information" class="panel"><div class="panel-header"><div><h2>Run information</h2><p>Context reported by the metrics endpoint</p></div><span class="subtle-label">OBSERVED</span></div><dl class="run-details"><div><dt>Run ID</dt><dd id="run-id">N/A</dd></div><div><dt>Observed Processing Rule</dt><dd id="observed-rule">N/A</dd></div><div><dt>Last Data Update</dt><dd><time id="last-data-update">N/A</time></dd></div><div><dt>Dashboard Connection Status</dt><dd id="detail-connection">Waiting for data</dd></div></dl><p class="context-note">An observed rule is not confirmation of the configured Kafka Streams rule.</p></section>
+    </div>
+    <footer class="page-footer"><span><span class="small-dot" aria-hidden="true"></span> Measurement Consumer · Operational view</span><span>Scientific measurements are stored separately in CSV / JSON.</span></footer>
+    <noscript><p class="noscript-warning">JavaScript is required to retrieve and display dashboard metrics.</p></noscript>
+  </main>
+</body>
+</html>
