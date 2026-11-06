@@ -1,10 +1,13 @@
 package com.kafkaiot.streams.topology;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kafkaiot.streams.model.SensorAlert;
 import com.kafkaiot.streams.model.SensorEvent;
 import com.kafkaiot.streams.model.SensorResult;
 import com.kafkaiot.streams.rules.HighTemperatureRule;
+import com.kafkaiot.streams.rules.HighFrequencyProcessor;
+import com.kafkaiot.streams.state.StateStoreDefinitions;
 import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -13,8 +16,10 @@ import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Produced;
 
-/** Stateless HIGH_TEMPERATURE processing with separate result and alert outputs. */
+/** Builds rule-specific topologies with separate result and alert outputs. */
 public final class SensorTopology {
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
     private SensorTopology() {
     }
 
@@ -47,6 +52,40 @@ public final class SensorTopology {
             }
         }).to("sensor-results", Produced.with(Serdes.String(), Serdes.String()));
 
+        publishAlerts(results);
+        return builder.build();
+    }
+
+    /** Builds stateful HIGH_FREQUENCY processing for events keyed by deviceId. */
+    public static Topology buildHighFrequency(long windowDurationMs, int countThreshold) {
+        if (windowDurationMs <= 0) {
+            throw new IllegalArgumentException("windowDurationMs must be positive");
+        }
+        if (countThreshold <= 0) {
+            throw new IllegalArgumentException("countThreshold must be positive");
+        }
+
+        StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(StateStoreDefinitions.highFrequencyStoreBuilder());
+        KStream<String, String> input = builder.stream("sensor-events",
+                Consumed.with(Serdes.String(), Serdes.String()));
+        KStream<String, String> resultJson = input.process(
+                () -> new HighFrequencyProcessor(windowDurationMs, countThreshold),
+                StateStoreDefinitions.HIGH_FREQUENCY_STORE);
+        resultJson.to("sensor-results", Produced.with(Serdes.String(), Serdes.String()));
+
+        KStream<String, SensorResult> results = resultJson.mapValues(json -> {
+            try {
+                return OBJECT_MAPPER.readValue(json, SensorResult.class);
+            } catch (JsonProcessingException exception) {
+                throw new SerializationException("Failed to deserialize SensorResult", exception);
+            }
+        });
+        publishAlerts(results);
+        return builder.build();
+    }
+
+    private static void publishAlerts(KStream<String, SensorResult> results) {
         results.filter((key, result) -> result.triggered())
                 .mapValues(result -> {
                     SensorAlert alert = new SensorAlert(result.eventId(), result.runId(),
@@ -59,6 +98,5 @@ public final class SensorTopology {
                 })
                 .to("sensor-alerts", Produced.with(Serdes.String(), Serdes.String()));
 
-        return builder.build();
     }
 }
