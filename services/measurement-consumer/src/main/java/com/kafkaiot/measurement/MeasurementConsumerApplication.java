@@ -2,8 +2,13 @@ package com.kafkaiot.measurement;
 
 import com.kafkaiot.measurement.config.ConsumerKafkaConfig;
 import com.kafkaiot.measurement.consumer.MeasurementKafkaConsumer;
+import com.kafkaiot.measurement.io.SensorResultCsvWriter;
 import com.kafkaiot.measurement.metrics.MeasurementAggregator;
 
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -14,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 /** Standalone Measurement Consumer entry point with explicit CLI configuration. */
 public final class MeasurementConsumerApplication {
     private static final Set<String> OPTIONS = Set.of(
-            "bootstrap-servers", "group-id", "auto-offset-reset");
+            "bootstrap-servers", "group-id", "auto-offset-reset", "result-csv-output");
 
     private MeasurementConsumerApplication() {
     }
@@ -28,6 +33,7 @@ public final class MeasurementConsumerApplication {
                       --group-id ID
                     Optional:
                       --auto-offset-reset earliest|latest (default: earliest)
+                      --result-csv-output PATH (new file; e.g. experiments/results/<runId>/sensor-results.csv)
                     Use --help alone to display this help without starting the consumer.
                     """);
             return;
@@ -35,18 +41,115 @@ public final class MeasurementConsumerApplication {
         try {
             execute(parse(args));
         } catch (RuntimeException exception) {
-            System.err.println("Measurement Consumer startup or execution failed: " + exception);
+            reportFailure(exception);
             throw exception;
         }
     }
 
+    static void reportFailure(RuntimeException exception) {
+        System.err.println("Measurement Consumer startup or execution failed: " + exception);
+        if (hasCsvFailure(exception)) {
+            System.err.println("Result CSV file-writing or cleanup failed; execution incomplete. "
+                    + "Available observations are partial.");
+        }
+    }
+
     private static void execute(Map<String, String> options) {
+        execute(options, MeasurementKafkaConsumer::new, new CountDownLatch(1));
+    }
+
+    @FunctionalInterface
+    interface ConsumerFactory {
+        MeasurementKafkaConsumer create(Properties properties, MeasurementAggregator aggregator,
+                                        SensorResultCsvWriter writer);
+    }
+
+    // Allows lifecycle verification with an in-memory consumer and an observable completion latch.
+    static void execute(Map<String, String> options, ConsumerFactory factory, CountDownLatch completed) {
         Properties properties = ConsumerKafkaConfig.createProperties(
                 options.get("bootstrap-servers"), options.get("group-id"),
                 options.getOrDefault("auto-offset-reset", "earliest"));
         MeasurementAggregator aggregator = new MeasurementAggregator();
-        MeasurementKafkaConsumer consumer = new MeasurementKafkaConsumer(properties, aggregator);
-        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            try {
+                SensorResultCsvWriter writer = openResultWriter(options);
+                try (Closeable cleanup = () -> closeResultWriter(writer)) {
+                    MeasurementKafkaConsumer consumer = factory.create(properties, aggregator, writer);
+                    runConsumer(consumer, completed);
+                }
+            } catch (IOException exception) {
+                if (!hasCsvFailure(exception)) {
+                    markCsvFailure(exception);
+                }
+                throw new UncheckedIOException("Result CSV creation or closure failed; execution incomplete", exception);
+            }
+            System.out.println("Measurement Consumer counts:");
+            System.out.println("Total received results: " + aggregator.getReceivedResultCount());
+            System.out.println("Unique received results: " + aggregator.getUniqueResultCount());
+            System.out.println("Duplicate result deliveries: " + aggregator.getDuplicateResultCount());
+            System.out.println("Received alerts: " + aggregator.getReceivedAlertCount());
+        } finally {
+            // Includes writer closure, even when construction, polling, or cleanup fails.
+            completed.countDown();
+        }
+    }
+
+    private static SensorResultCsvWriter openResultWriter(Map<String, String> options) throws IOException {
+        if (!options.containsKey("result-csv-output")) {
+            return null;
+        }
+        String value = options.get("result-csv-output");
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("--result-csv-output requires a usable file path");
+        }
+        return new SensorResultCsvWriter(Path.of(value));
+    }
+
+    private static void closeResultWriter(SensorResultCsvWriter writer) throws IOException {
+        if (writer != null) {
+            try {
+                writer.close();
+            } catch (IOException exception) {
+                markCsvFailure(exception);
+                throw exception;
+            }
+        }
+    }
+
+    private static void markCsvFailure(IOException exception) {
+        exception.addSuppressed(new CsvFailureMarker());
+    }
+
+    /** Marks I/O failures caught specifically at the owned CSV resource boundary. */
+    private static final class CsvFailureMarker extends Exception {
+    }
+
+    private static boolean hasCsvFailure(Throwable exception) {
+        if (exception instanceof CsvFailureMarker) {
+            return true;
+        }
+        // D.6.14 has no dedicated exception type; verify its wrapper and origin.
+        StackTraceElement[] origin = exception.getStackTrace();
+        if (exception instanceof IllegalStateException && exception.getCause() instanceof IOException
+                && exception.getMessage() != null
+                && exception.getMessage().startsWith("Failed to write result CSV for topic ")
+                && origin.length > 0
+                && origin[0].getClassName().equals(MeasurementKafkaConsumer.class.getName())
+                && origin[0].getMethodName().equals("handleRecord")) {
+            return true;
+        }
+        if (exception.getCause() != null && hasCsvFailure(exception.getCause())) {
+            return true;
+        }
+        for (Throwable suppressed : exception.getSuppressed()) {
+            if (hasCsvFailure(suppressed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void runConsumer(MeasurementKafkaConsumer consumer, CountDownLatch completed) {
         Thread shutdownHook = new Thread(() -> {
             try {
                 consumer.shutdown();
@@ -74,16 +177,7 @@ public final class MeasurementConsumerApplication {
             }
             throw exception;
         }
-        try {
-            consumer.run();
-            System.out.println("Measurement Consumer counts:");
-            System.out.println("Total received results: " + aggregator.getReceivedResultCount());
-            System.out.println("Unique received results: " + aggregator.getUniqueResultCount());
-            System.out.println("Duplicate result deliveries: " + aggregator.getDuplicateResultCount());
-            System.out.println("Received alerts: " + aggregator.getReceivedAlertCount());
-        } finally {
-            completed.countDown();
-        }
+        consumer.run();
     }
 
     private static Map<String, String> parse(String[] args) {
