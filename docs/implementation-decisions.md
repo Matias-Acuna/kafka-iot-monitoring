@@ -120,3 +120,35 @@ This decision avoids an additional YAML parser and unnecessary duplicate configu
 This decision applies only to the Kafka Streams service. It does not change the existing Sensor Producer configuration decision or automatically change the future Measurement Consumer configuration.
 
 This is an explicitly approved implementation adaptation. It does not modify the official Phase D protocol or Chapter 4.
+
+## D.4.9 — Measurement Consumer CLI Configuration
+
+- **Approval date:** 2026-11-06
+- **Status:** Approved by the project owner
+- **Component:** `services/measurement-consumer`
+
+### Original approved design
+
+The official Phase D protocol originally specifies `services/measurement-consumer/src/main/resources/application.yml` for the Measurement Consumer configuration.
+
+### Approved implementation change
+
+Use command-line (CLI) arguments for the Measurement Consumer configuration instead of `application.yml`.
+
+### Technical rationale
+
+- The Measurement Consumer is a standalone Java 21 application using Apache Kafka Clients 4.1.2.
+- CLI configuration is consistent with the previously approved Sensor Producer and Kafka Streams implementations.
+- No additional YAML parser or application framework is necessary.
+- Runtime parameters can be supplied explicitly for experimental executions.
+- Avoiding redundant configuration reduces unnecessary complexity.
+
+### Experimental implications
+
+Runtime configuration can be supplied explicitly through CLI arguments for each experimental execution. This decision does not modify the experimental methodology in Chapter 4.
+
+### Scope and traceability
+
+This decision applies only to the Measurement Consumer. All previous implementation decisions remain unchanged.
+
+This is an explicitly approved implementation adaptation. The original Phase D protocol remains unchanged.
