@@ -24,8 +24,8 @@ class ThroughputTest(unittest.TestCase):
         self.config, self.producer, self.consumer, self.output = (
             root / name for name in ("run-config.json", "producer-events.csv",
                                      "sensor-results.csv", "throughput.csv"))
-        # This opaque test marker is NOT a proposed coordinator status schema.
-        # Calculation tests isolate the future independent completeness verifier.
+        # Use a synthetic status and mock finalization to test
+        # throughput calculations independently of the coordinator.
         self.completion_patch = patch.object(MODULE, "coordinator_completion_verified", return_value=True)
         self.completion_verifier = self.completion_patch.start()
         self.addCleanup(self.completion_patch.stop)

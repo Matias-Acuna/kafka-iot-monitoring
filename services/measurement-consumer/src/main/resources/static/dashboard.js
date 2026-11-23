@@ -1,5 +1,5 @@
 /*
- * Expected GET /metrics/dashboard contract (proposed; backend not implemented):
+ *  Response contract for GET /metrics/dashboard:
  * {
  *   runId: string|null, observedRule: string|null,
  *   totalResults: number|null, uniqueResults: number|null,

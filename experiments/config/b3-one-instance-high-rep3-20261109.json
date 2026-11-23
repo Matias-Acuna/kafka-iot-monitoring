@@ -1,0 +1,52 @@
+{
+  "runId": "fd8-b3-one-instance-high-rep3-20261109",
+  "scenario": "B3",
+  "outputDirectory": "experiments/results/fd8-b3-one-instance-high-rep3-20261109",
+  "commands": {
+    "consumer": [
+      "./scripts/run-measurement-consumer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--group-id",
+      "fd8-b3-one-instance-high-rep3-20261109-consumer",
+      "--auto-offset-reset",
+      "latest"
+    ],
+    "streams": [
+      "./scripts/run-kafka-streams-b3.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--application-id",
+      "fd8-b3-one-instance-high-rep3-20261109-streams",
+      "--rule",
+      "RAPID_CHANGE",
+      "--max-time-difference-ms",
+      "5000",
+      "--temperature-change-threshold",
+      "5.0",
+      "--cpu-quota",
+      "200%",
+      "--memory-max",
+      "4G",
+      "--state-dir",
+      "/tmp/kafka-iot-monitoring-b3/fd8-b3-one-instance-high-rep3-20261109/streams-1"
+    ],
+    "producer": [
+      "./scripts/run-sensor-producer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--random-seed",
+      "789",
+      "--initial-event-timestamp",
+      "1700000000000",
+      "--timestamp-increment",
+      "1",
+      "--target-events-per-second",
+      "1000",
+      "--acks",
+      "all",
+      "--enable-idempotence",
+      "true"
+    ]
+  }
+}

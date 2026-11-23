@@ -1,0 +1,46 @@
+{
+  "runId": "fd8-b1-high-frequency-low-rep1-20261109",
+  "scenario": "B1",
+  "outputDirectory": "experiments/results/fd8-b1-high-frequency-low-rep1-20261109",
+  "commands": {
+    "consumer": [
+      "./scripts/run-measurement-consumer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--group-id",
+      "fd8-b1-high-frequency-low-rep1-20261109-consumer",
+      "--auto-offset-reset",
+      "latest"
+    ],
+    "streams": [
+      "./scripts/run-kafka-streams.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--application-id",
+      "fd8-b1-high-frequency-low-rep1-20261109-streams",
+      "--rule",
+      "HIGH_FREQUENCY",
+      "--window-duration-ms",
+      "10000",
+      "--count-threshold",
+      "20"
+    ],
+    "producer": [
+      "./scripts/run-sensor-producer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--random-seed",
+      "123",
+      "--initial-event-timestamp",
+      "1700000000000",
+      "--timestamp-increment",
+      "1",
+      "--target-events-per-second",
+      "10",
+      "--acks",
+      "all",
+      "--enable-idempotence",
+      "true"
+    ]
+  }
+}

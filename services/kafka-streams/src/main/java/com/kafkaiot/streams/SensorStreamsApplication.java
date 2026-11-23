@@ -17,7 +17,7 @@ import java.util.Set;
 public final class SensorStreamsApplication {
     private static final Set<String> OPTIONS = Set.of(
             "bootstrap-servers", "application-id", "rule", "temperature-threshold",
-            "window-duration-ms", "count-threshold", "max-time-difference-ms", "temperature-change-threshold", "lifecycle-stdout");
+            "window-duration-ms", "count-threshold", "max-time-difference-ms", "temperature-change-threshold", "lifecycle-stdout", "state-dir");
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(30);
 
     private SensorStreamsApplication() {
@@ -40,6 +40,7 @@ public final class SensorStreamsApplication {
                       --max-time-difference-ms LONG (positive milliseconds)
                       --temperature-change-threshold DOUBLE (finite and positive)
                     Optional:
+                      --state-dir DIRECTORY (default: Kafka Streams default state directory)
                       --lifecycle-stdout true|false (default: false; lifecycle JSON evidence)
                     Options belonging to the other rule are rejected.
                     Use --help alone to display this help without starting Kafka Streams.
@@ -87,6 +88,10 @@ public final class SensorStreamsApplication {
 
             Properties properties = StreamsConfig.createProperties(
                     options.get("bootstrap-servers"), options.get("application-id"));
+            if (options.containsKey("state-dir")) {
+                properties.setProperty(org.apache.kafka.streams.StreamsConfig.STATE_DIR_CONFIG,
+                        options.get("state-dir"));
+            }
             emitConfiguration(properties, rule, ruleParameters,
                     "true".equals(options.get("lifecycle-stdout")));
             KafkaStreams streams = new KafkaStreams(topology, properties);

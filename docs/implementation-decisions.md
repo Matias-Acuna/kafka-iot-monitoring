@@ -1,51 +1,22 @@
 # Implementation Decisions
 
-## D.2.34 — Sensor Producer CLI Configuration
+This document records the technical choices behind the IoT monitoring implementation. It focuses on configuration, event contracts, measurement rules, and experimental execution. The experimental methodology and interpretation of results are described in the Bachelor thesis.
 
-- **Approval date:** 2026-11-05
-- **Status:** Approved by the project owner
-- **Component:** `services/sensor-producer`
+## 1. Runtime configuration
 
-### Original approved design
+The Sensor Producer, Kafka Streams application, and Measurement Consumer are standalone Java 21 services. Their runtime settings are passed as command-line arguments rather than through `application.yml` files. This keeps the configuration explicit for each experiment and avoids adding a separate YAML configuration mechanism.
 
-The official Phase D protocol included `src/main/resources/application.yml` in the Sensor Producer structure.
+- **Sensor Producer** (`services/sensor-producer`): workload rate, random seed, timestamps, broker addresses, and producer settings such as acknowledgments and idempotence are supplied through the CLI.
+- **Kafka Streams** (`services/kafka-streams`): broker addresses, application ID, active processing rule, and rule-specific thresholds are supplied through the CLI. The application supports `HIGH_TEMPERATURE`, `HIGH_FREQUENCY`, and `RAPID_CHANGE`.
+- **Measurement Consumer** (`services/measurement-consumer`): broker addresses, consumer group, offset behavior, and measurement options are configured through the CLI.
 
-### Approved implementation change
+Keeping these settings outside the application code allows each experimental run to use its own configuration without changing the Java sources. The configuration used during a run is recorded with its experimental evidence.
 
-Do not create `application.yml` for the Sensor Producer. Use the existing CLI configuration implemented in `SensorProducerApplication.java`.
+## 2. Kafka Streams output models
 
-### Technical rationale
+The Kafka Streams service publishes two kinds of JSON records: `SensorResult` and `SensorAlert`.
 
-- The producer uses plain Java 21 and Kafka Clients 4.1.2, without Spring Boot or a YAML configuration reader.
-- CLI arguments already supply and validate the required execution parameters.
-- The CLI mechanism has been functionally verified in Ubuntu and Docker.
-- Adding YAML support would introduce redundant configuration and unnecessary complexity.
-
-### Experimental implications
-
-- Workload settings and Kafka producer options remain configurable through CLI arguments.
-- Experimental reproducibility requires the parameters actually used to be recorded for each run.
-- The Chapter 4 methodology and B1–B4 experiment definitions remain unchanged.
-
-### Scope
-
-This decision applies only to the Sensor Producer. It does not automatically remove `application.yml` from the planned Kafka Streams or Measurement Consumer modules.
-
-### Traceability
-
-This is an explicitly authorized minor implementation adaptation to the official Phase D protocol, not a silent revision of that protocol.
-
-## D.3.13 — Kafka Streams Output Contracts
-
-- **Approval date:** 2026-11-05
-- **Status:** Approved by the project owner
-- **Component:** `services/kafka-streams`
-
-### Approved output contracts
-
-`SensorResult` and `SensorAlert` are the formally approved Kafka Streams output contracts. Their fields and Java types are defined in the following order.
-
-**SensorResult**
+### SensorResult
 
 | Field | Java type |
 | --- | --- |
@@ -57,7 +28,7 @@ This is an explicitly authorized minor implementation adaptation to the official
 | `ruleType` | `String` |
 | `triggered` | `boolean` |
 
-**SensorAlert**
+### SensorAlert
 
 | Field | Java type |
 | --- | --- |
@@ -68,125 +39,31 @@ This is an explicitly authorized minor implementation adaptation to the official
 | `sentAt` | `long` |
 | `ruleType` | `String` |
 
-### Output semantics
+A `SensorResult` is written for each successfully processed input event, even when the active rule does not trigger. Its `triggered` field records the evaluation outcome. A `SensorAlert` is written only for a triggered rule. The supported `ruleType` values are `HIGH_TEMPERATURE`, `HIGH_FREQUENCY`, and `RAPID_CHANGE`.
 
-- One `SensorResult` is produced per successfully processed input event, regardless of whether the active rule triggers. Its `triggered` field records that outcome.
-- A `SensorAlert` is produced separately only when the active rule triggers.
-- `ruleType` uses `String` with the controlled values `HIGH_TEMPERATURE`, `HIGH_FREQUENCY`, and `RAPID_CHANGE`.
-- `eventId`, `runId`, `deviceId`, `eventTime`, and `sentAt` preserve the corresponding input event values. Both timestamps retain their Unix epoch millisecond meaning.
-- Stateful alerts are associated with the input event that triggers their condition, rather than independent window summaries.
+Both models retain the identifiers and timestamps of the input event. `eventTime` and `sentAt` represent Unix epoch milliseconds. For stateful rules, an alert refers to the input event that caused the condition to trigger, not to an independent window summary.
 
-### Minimal contract scope
+The output models deliberately omit the temperature, thresholds, counts, and other rule-specific diagnostic data. `SensorAlert` has no `triggered` field because every alert already represents a triggered condition. The receipt timestamp `resultReceivedAt` is recorded by the Measurement Consumer rather than Kafka Streams.
 
-These contracts exclude temperature, thresholds, frequency counts, temperature differences, and additional diagnostic fields. `SensorAlert` has no `triggered` field because its presence represents a triggered condition.
+These fields allow producer events and consumer observations to be matched by `(runId, eventId)` and provide the timestamps required for end-to-end latency measurement.
 
-`resultReceivedAt` belongs to the Measurement Consumer and is not part of either Kafka Streams output model. The Measurement Consumer calculates E2E latency as `resultReceivedAt - sentAt`.
+## 3. Experimental metrics and observations
 
-### Experimental implications and traceability
+The measurement pipeline distinguishes between attempted publications, confirmed publications, and unique results received by the Measurement Consumer. It also records alert counts, individual end-to-end latencies, duplicate deliveries, unmatched confirmed events, and relevant errors. Broker leadership and in-sync replica (ISR) observations are used for the failure/recovery scenario.
 
-The contracts preserve event and run traceability, maintain the timestamps needed by the experimental design, and support the subsequent FD4 and FD5 implementation stages across all three rules.
+### Latency
 
-This is an approved implementation-level contract decision. It does not modify the official Phase D protocol or Chapter 4.
-
-## D.3.31 — Kafka Streams CLI Configuration
-
-- **Approval date:** 2026-11-05
-- **Status:** Approved by the project owner
-- **Component:** `services/kafka-streams`
-
-### Original approved design
-
-The official Phase D protocol originally specifies an `application.yml` file for the Kafka Streams service.
-
-### Approved implementation change
-
-The project owner explicitly approved replacing `application.yml` with command-line (CLI) configuration for this service. The Kafka Streams application will receive its runtime configuration through these planned parameters:
-
-- `--bootstrap-servers`
-- `--application-id`
-- `--rule`
-- `--temperature-threshold`
-
-Initially, only `HIGH_TEMPERATURE` will be supported as the active rule. `HIGH_FREQUENCY` and `RAPID_CHANGE` belong to the later D.5 implementation stage. The temperature threshold must remain configurable, not hardcoded.
-
-The existing `StreamsConfig.createProperties()` method will be reused for Kafka Streams baseline properties. The CLI implementation is still pending and will be developed in subsequent steps.
-
-### Technical rationale
-
-This decision avoids an additional YAML parser and unnecessary duplicate configuration mechanisms. The approach remains consistent with the previously approved CLI configuration of the Sensor Producer.
-
-### Scope and traceability
-
-This decision applies only to the Kafka Streams service. It does not change the existing Sensor Producer configuration decision or automatically change the future Measurement Consumer configuration.
-
-This is an explicitly approved implementation adaptation. It does not modify the official Phase D protocol or Chapter 4.
-
-## D.4.9 — Measurement Consumer CLI Configuration
-
-- **Approval date:** 2026-11-06
-- **Status:** Approved by the project owner
-- **Component:** `services/measurement-consumer`
-
-### Original approved design
-
-The official Phase D protocol originally specifies `services/measurement-consumer/src/main/resources/application.yml` for the Measurement Consumer configuration.
-
-### Approved implementation change
-
-Use command-line (CLI) arguments for the Measurement Consumer configuration instead of `application.yml`.
-
-### Technical rationale
-
-- The Measurement Consumer is a standalone Java 21 application using Apache Kafka Clients 4.1.2.
-- CLI configuration is consistent with the previously approved Sensor Producer and Kafka Streams implementations.
-- No additional YAML parser or application framework is necessary.
-- Runtime parameters can be supplied explicitly for experimental executions.
-- Avoiding redundant configuration reduces unnecessary complexity.
-
-### Experimental implications
-
-Runtime configuration can be supplied explicitly through CLI arguments for each experimental execution. This decision does not modify the experimental methodology in Chapter 4.
-
-### Scope and traceability
-
-This decision applies only to the Measurement Consumer. All previous implementation decisions remain unchanged.
-
-This is an explicitly approved implementation adaptation. The original Phase D protocol remains unchanged.
-
-## D.6.2 — FD6 Experimental Metrics and Export Design
-
-- **Approval date:** 2026-11-06
-- **Status:** Approved by the project owner
-- **Component:** FD6 experimental metrics and exports across the Sensor Producer, Kafka Streams, and Measurement Consumer
-
-### Approved implementation design
-
-FD6 will implement the following experimental measurements:
-
-- Attempted input throughput and confirmed input throughput.
-- Unique results throughput, with per-second observations.
-- Per-second observations of attempted and confirmed inputs, and alerts per second as a secondary metric.
-- Individual end-to-end latency and P50, P95, and P99 latency percentiles.
-- Missing results and duplicate deliveries, counted separately.
-- Production and processing errors.
-- Interruption and recovery observations.
-- Broker leadership and in-sync replica (ISR) observations.
-
-These are approved implementation requirements, not a claim that all measurements or exports already exist.
-
-### Latency and percentile calculation
-
-Calculate individual end-to-end latency in milliseconds as:
+End-to-end latency is calculated in milliseconds:
 
 ```text
 latencyMs = resultReceivedAt - sentAt
 ```
 
-Calculate P50, P95, and P99 using Type 7 linear interpolation, with P50 representing the median. Use unique measurement-event results, including eligible results received during drain. Retain and flag negative latency observations instead of silently converting them to zero.
+P50, P95, and P99 are calculated using Type 7 linear interpolation; P50 is the median. The latency population uses unique results for measurement-phase events, including eligible results received during the drain period. Negative latency values are retained and flagged rather than changed to zero.
 
-### Experimental phases and throughput
+### Phases
 
-The approved ordinary experimental phases are:
+The standard B1–B3 execution has three phases:
 
 | Phase | Duration |
 | --- | --- |
@@ -194,109 +71,51 @@ The approved ordinary experimental phases are:
 | `MEASUREMENT` | 300 seconds |
 | `DRAIN` | Up to 120 seconds |
 
-Results from measurement-phase events received during drain count for latency and completeness checks, but not for measured throughput during the 300-second measurement interval. Throughput observations must use actual elapsed time, not simulated `eventTime`.
+Warm-up gives the services time to settle before throughput measurement. Drain allows late results from measurement-phase events to be collected for latency and completeness checks. It does not extend the 300-second throughput interval. Observed throughput is calculated from actual timestamps, not the synthetic `eventTime` values.
 
-### Reliability accounting
+### Reliability
 
-- Identify events by `(runId, eventId)` and retain confirmed producer event identities.
-- Count unique received results separately from duplicate deliveries.
-- Reconcile confirmed inputs against unique received results after the drain boundary.
-- Do not automatically equate missing results with Kafka data loss.
+Events are identified using `(runId, eventId)`. Confirmed publications are compared with unique received results after drain, while duplicate deliveries are counted separately. An unmatched confirmed event is reported as a missing result; this alone does not establish Kafka data loss.
 
-### Experimental export structure
+### Evidence files
 
-Store each run's experimental observations under:
+Experimental evidence is stored under `experiments/results/<runId>/`. The main files are:
 
-```text
-experiments/results/<runId>/
-    run-config.json
-    producer-events.csv
-    sensor-results.csv
-    throughput.csv
-    summary.json
-    errors.log
-```
-
-| File | Intended purpose |
+| File | Contents |
 | --- | --- |
-| `run-config.json` | Record the actual configuration, workload parameters, random seeds, and phase boundaries. |
-| `producer-events.csv` | Preserve individual producer event identities and publication outcomes, including confirmation evidence for reconciliation. |
-| `sensor-results.csv` | Preserve individual received-result observations, including receipt timestamps, calculated latency, duplicate status, and negative-latency flags. |
-| `throughput.csv` | Record per-second attempted input, confirmed input, unique result, and secondary alert observations using actual elapsed time. |
-| `summary.json` | Record measured run summaries, latency percentiles, reliability accounting, and execution completion status. |
-| `errors.log` | Preserve production and processing errors and interruption, recovery, broker leadership, and ISR observations. |
+| `run-config.json` | Actual run configuration, timing, and finalization metadata |
+| `producer-events.csv` | Per-event publication attempts, confirmations, and related timestamps |
+| `sensor-results.csv` | Received results, receipt timestamps, latency, and duplicate information |
+| `throughput.csv` | Per-second attempted, confirmed, and unique-result observations |
+| `summary.json` | Aggregated throughput, latency, reliability, and completion information |
+| `coordination.jsonl` | Coordinator events and operational evidence, including B4 actions |
+| `errors.log` | Recorded execution errors |
 
-Preserve available partial observations from incomplete executions and explicitly record their completion status. Incomplete executions must not be presented as valid completed experimental runs. Store experimental observations separately from dashboard visualization.
+Incomplete runs retain their available evidence but are not treated as completed experimental observations. The files used for scientific evaluation are separate from the live Dashboard.
 
-### B4 experimental implications
+## 4. Throughput measurement policy
 
-B4 retains its special experimental procedure and provisional recovery criteria defined in Chapter 4:
+For B1–B3, a publication or result contributes to primary throughput only when both conditions hold:
 
-- Service rates must reach at least 95% of the pre-failure reference for 30 seconds, without sustained growth of pending events.
-- The pre-failure reference is based on the 60 seconds immediately before broker interruption.
-- Full ISR recovery must be maintained for 30 seconds.
-- These provisional recovery criteria require validation through pilot tests.
+1. The originating event belongs to `MEASUREMENT`.
+2. The corresponding publication or receipt timestamp falls within the fixed 300-second measurement interval.
 
-### Technical rationale and implementation restrictions
+Attempted inputs, confirmed inputs, and unique results are reported separately. Results are deduplicated by `(runId, eventId)`, and one-second time bins include intervals with no observations.
 
-- Reuse existing components wherever possible and avoid unnecessary dependencies and services.
-- Prefer progressive writing of individual measurements to limit memory usage.
-- Preserve the existing Kafka message contracts and established processing rules.
-- Do not change Chapter 4 or its experimental methodology.
-- Do not execute final B1–B4 experiments in FD6.
-- Preserve the separation between FD6 metrics, FD7 dashboard visualization, and FD8 experiments.
+Warm-up events confirmed during measurement do not count toward measurement throughput. Likewise, measurement events confirmed or received during drain remain available for latency and reliability analysis, but are not moved into the throughput interval. B4 uses additional time-based observations for interruption and recovery rather than treating its failure period as an ordinary B1–B3 run.
 
-### Scope and traceability
+## 5. Run metadata and timing
 
-This decision records implementation details formally approved by the project owner for FD6. It does not replace or modify the official Phase D protocol or the methodology in Chapter 4. All previous implementation decisions remain unchanged.
+Each experiment has a separate `run-config.json` file. The Sensor Producer writes its metadata when the optional `--run-config-output` argument is enabled. The coordinator takes over the file only after the Producer has finished, so the two processes do not write to it simultaneously. Metadata from a different `runId` must not be overwritten.
 
-## D.6.42 — Experimental Throughput Policy
+A run is not considered complete just because the Producer has exited. Runs that have not passed finalization remain marked `NOT_FINALIZED`; unavailable measurements are recorded as unknown rather than filled with estimated values.
 
-- **Status:** FORMALLY APPROVED
-- **Component:** FD6 experimental throughput measurement
+Two Java clocks are used for different purposes:
 
-### Approved policy
+- `System.nanoTime()` measures local elapsed time and schedules phases.
+- `System.currentTimeMillis()` records epoch timestamps for observations and exported evidence.
 
-For ordinary B1–B3 experiments, primary measurement throughput includes only observations satisfying both conditions:
-
-- The original event belongs to `MEASUREMENT`.
-- The corresponding observation timestamp falls inside the fixed 300-second measurement interval.
-
-Measure attempted input, confirmed input, and unique result throughput separately. Deduplicate unique results by `(runId, eventId)`. Use actual observation timestamps and one-second bins, including zero-count bins.
-
-Warm-up events confirmed during measurement do not contribute to primary measurement throughput. Measurement events confirmed or received during drain do not contribute to measurement throughput. Preserve late observations for latency, reliability, and reconciliation analysis; never move their timestamps backward or reassign them to measurement throughput.
-
-### Scope and traceability
-
-This formally approved measurement policy preserves the existing Chapter 4 methodology and official Phase D protocol. It does not replace the separate B4 failure/recovery methodology.
-
-## D.6.43 — Run Metadata Ownership
-
-- **Status:** FORMALLY APPROVED
-- **Component:** Experimental run metadata
-
-### Approved ownership
-
-Use one metadata file per `runId` at `experiments/results/<runId>/run-config.json`. The Sensor Producer creates and updates its own metadata through the optional `--run-config-output <path>` argument. The experimental coordinator assumes ownership only after the Producer finishes and releases ownership.
-
-Never allow simultaneous writers or overwrite metadata belonging to another `runId`. Incomplete experiments remain explicitly `NOT_FINALIZED` until properly finalized. Producer completion does not imply completion of the entire experiment.
-
-Store actual configuration and timing information; unavailable values remain explicitly unknown.
-
-### Scope and traceability
-
-This formally approved ownership decision governs metadata persistence and handoff. It does not change Chapter 4 or the official Phase D protocol.
-
-## D.6.44 — Clock Handling Convention
-
-- **Status:** ACCEPTED TECHNICAL IMPLEMENTATION CONVENTION
-- **Component:** Experimental timing observations
-
-### Accepted convention
-
-Use `System.nanoTime()` for local elapsed timing and phase scheduling. Use `System.currentTimeMillis()` for epoch timestamps of recorded observations.
-
-Capture closely associated clock readings at workload start:
+At workload start, closely spaced `nanoTime()` and epoch readings are captured to qualify their alignment:
 
 ```java
 long n0 = System.nanoTime();
@@ -305,16 +124,70 @@ long n1 = System.nanoTime();
 long sampleSpanNs = n1 - n0;
 ```
 
-The association and `sampleSpanNs` qualify epoch alignment; they do not establish perfectly exact alignment. Do not compare `nanoTime()` values across independent JVMs. Preserve original timestamps and flag relevant clock inconsistencies rather than silently correcting them. Do not add synchronization infrastructure.
+This sampling provides an alignment estimate, not exact synchronization. `nanoTime()` readings are not compared across separate JVMs, and clock inconsistencies are reported rather than silently corrected.
 
-### Scope and traceability
+The corresponding implementation is located in `RunMetadataWriter`, `WorkloadRunner`, and the Producer's optional metadata-output handling.
 
-This is a technical implementation convention, not an additional Chapter 4 methodological requirement. The approved experimental methodology and official Phase D protocol remain unchanged.
+## 6. Experimental workloads
 
-### Implementation status — D.6.45–D.6.47
+The configured Producer rates are targets, not guaranteed achieved throughput:
 
-- **D.6.45:** `RunMetadataWriter` implemented and tested.
-- **D.6.46:** `WorkloadRunner` timing snapshots implemented.
-- **D.6.47:** Optional Producer `--run-config-output` integration implemented and unit-tested.
+| Level | Requested rate (events/s) |
+| --- | ---: |
+| LOW | 10 |
+| MEDIUM | 100 |
+| HIGH | 1000 |
 
-These components do not yet constitute a fully finalized experimental measurement pipeline. Real-Kafka metadata integration has not yet been verified.
+The scenarios use these workloads:
+
+| Scenario | Workload levels |
+| --- | --- |
+| B1 — Processing Patterns | LOW, MEDIUM, HIGH |
+| B2 — Kafka Configuration | LOW, HIGH |
+| B3 — Local Parallelism | HIGH |
+| B4 — Broker Failure and Recovery | MEDIUM |
+
+Each run records the requested input rate alongside the actual attempted and confirmed rates. The experimental plan uses three repetitions per condition, paired random seeds for comparable variants, a documented execution order, and cleanup between independent runs.
+
+### Preliminary workload checks
+
+Three `HIGH_TEMPERATURE` pilot runs helped select the target rates. Their mean confirmed input rates over the 300-second measurement interval were:
+
+| Requested rate (events/s) | Confirmed rate (events/s) | Evidence |
+| --- | ---: | --- |
+| 10 | 10.00 | [Reference pilot](../experiments/results/fd8-b1-high-temperature-reference-20261109/summary.json) |
+| 100 | 100.00 | [100 events/s pilot](../experiments/results/fd8-b1-high-temperature-pilot-100eps-20261109/summary.json) |
+| 1000 | approximately 950.51 | [1000 events/s pilot](../experiments/results/fd8-b1-high-temperature-pilot-1000eps-20261109/summary.json) |
+
+These are individual pilot results, not substitutes for the three-repetition evaluation. The lower achieved rate at the highest target does not, by itself, show that Kafka was saturated or identify a single bottleneck.
+
+## 7. B3: local Kafka Streams parallelism
+
+B3 uses `RAPID_CHANGE` as the fixed processing rule. This rule retains the previous temperature and event timestamp for each `(runId, deviceId)` and checks the change against the current event. Using the same stateful rule in both conditions keeps the processing logic constant while the number of Kafka Streams instances changes.
+
+Both conditions use:
+
+- `maxTimeDifferenceMs = 5000`
+- `temperatureChangeThreshold = 5.0`
+- Three Kafka brokers and six partitions per application topic
+- A requested Producer rate of 1000 events/s
+
+| Condition | Streams instances | Threads per instance | CPU limit per instance | Memory limit per instance |
+| --- | ---: | ---: | --- | --- |
+| A | 1 | 1 | 2 CPU | 4 GiB |
+| B | 2 | 1 | 1 CPU | 2 GiB |
+
+The total Streams resource budget stays at 2 CPU and 4 GiB in both conditions. `scripts/run-kafka-streams-b3.sh` starts each instance in a `systemd-run --user --scope` unit with explicit `CPUQuota`, `MemoryMax`, and `MemorySwapMax=0` settings. The launcher rejects unsupported settings instead of starting an unrestricted JVM. The limits are resource ceilings, not dedicated cores.
+
+B3 measures local parallelism on a single physical machine. It does not represent scaling across separate hosts, and the configuration alone does not imply that two instances perform better than one.
+
+## 8. B4: broker failure and recovery observations
+
+B4 records the effects of stopping and restarting a broker in the three-broker topology. Besides the standard throughput, latency, and reliability metrics, the analysis considers service continuity, broker leadership, and ISR observations.
+
+The recovery assessment uses two criteria:
+
+- **Service recovery:** service rates reach at least 95% of the pre-failure reference for a continuous 30-second window, without sustained growth of reconstructed pending-event populations. The reference uses the 60 seconds immediately before the interruption.
+- **Replication recovery:** full ISR membership is observed and maintained for 30 seconds after a degradation.
+
+These criteria depend on the available publication, receipt, and metadata observations. A result that cannot be established from the recorded evidence must not be presented as confirmed recovery. The detailed B4 procedure and interpretation remain in the thesis.

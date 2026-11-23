@@ -187,8 +187,17 @@ class CoordinatorTest(unittest.TestCase):
 
     def test_valid_b1_b2_b3_configuration_and_evidence_flags(self):
         for scenario in ("B1", "B2", "B3"):
-            self.config["scenario"] = scenario
-            validated = MODULE.validate(self.config)
+            config = copy.deepcopy(self.config)
+            config["scenario"] = scenario
+            if scenario == "B3":
+                config["commands"]["streams"] = [
+                    str(Path(MODULE.__file__).resolve().with_name("run-kafka-streams-b3.sh")),
+                    "--bootstrap-servers", "unused:9092", "--application-id", "app-1",
+                    "--rule", "RAPID_CHANGE", "--max-time-difference-ms", "5000",
+                    "--temperature-change-threshold", "5", "--state-dir", str(self.root / "b3-state"),
+                    "--cpu-quota", "200%", "--memory-max", "4G"]
+                config["commands"]["producer"][config["commands"]["producer"].index("--target-events-per-second") + 1] = "1000"
+            validated = MODULE.validate(config)
             for role, option in (("consumer", "--readiness-stdout"), ("streams", "--lifecycle-stdout"),
                                  ("producer", "--timing-stdout")):
                 command = validated["commands"][role]
@@ -373,7 +382,18 @@ class MetadataHandoffTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.path = self.root / "run-config.json"
-        self.config = {"outputDirectory": self.root, "runId": "run-1", "scenario": "B2"}
+        self.config = {
+            "outputDirectory": self.root, "runId": "run-1", "scenario": "B2",
+            "commands": {
+                "consumer": [sys.executable, "consumer.py", "--bootstrap-servers", "unused:9092",
+                             "--group-id", "group-1"],
+                "streams": [sys.executable, "streams.py", "--bootstrap-servers", "unused:9092",
+                            "--application-id", "app-1", "--rule", "HIGH_TEMPERATURE",
+                            "--temperature-threshold", "30"],
+                "producer": [sys.executable, "producer.py", "--bootstrap-servers", "unused:9092",
+                             "--run-id", "run-1", "--random-seed", "123",
+                             "--initial-event-timestamp", "1700000000000", "--timestamp-increment", "1",
+                             "--target-events-per-second", "10"]}}
         self.processes = FakeProcesses(self.root)
         self.processes.codes["producer"] = 0
         self.original = producer_metadata()

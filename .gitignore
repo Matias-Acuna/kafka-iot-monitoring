@@ -1,4 +1,18 @@
+# Maven build files
 target/
 
-# Generated functional-test CSV results only
-/experiments/results/functional-test-*.csv
+# Python temporary files
+__pycache__/
+*.py[cod]
+
+# Experimental results
+/experiments/results/
+
+# Auxiliary evidence archives
+/b1-evidencias.zip
+/b2-evidencias.zip
+/b3-evidencias.zip
+/b4-evidencias.zip
+
+# Report backups
+/experiments/report-backups/

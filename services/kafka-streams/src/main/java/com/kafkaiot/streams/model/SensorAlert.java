@@ -4,7 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * Alert for a rule-triggering input event, as approved in D.3.13.
+ * Alert produced when a processing rule is triggered by an input event.
  * eventId, runId, deviceId, eventTime, and sentAt retain the input event's values;
  * eventTime and sentAt are Unix epoch milliseconds.
  * ruleType identifies HIGH_TEMPERATURE, HIGH_FREQUENCY, or RAPID_CHANGE.

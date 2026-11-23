@@ -1,6 +1,6 @@
-# Reference: Apache Kafka 4.1.2, Docker Compose KRaft isolated plaintext example.
+# Based on the official Apache Kafka 4.1.2 Docker Compose example (KRaft, isolated controllers, PLAINTEXT).
 # https://github.com/apache/kafka/blob/4.1.2/docker/examples/docker-compose-files/cluster/isolated/plaintext/docker-compose.yml
-# Application topics will be created later by create-topics.sh.
+# Application topics are created separately using create-topics.sh.
 x-common-environment: &common-environment
   CLUSTER_ID: '4L6g3nShT-eMCtK--X86sw'
   KAFKA_CONTROLLER_QUORUM_VOTERS: '1@controller-1:9093,2@controller-2:9093,3@controller-3:9093'

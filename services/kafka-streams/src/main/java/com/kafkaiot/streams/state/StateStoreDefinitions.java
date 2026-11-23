@@ -20,7 +20,7 @@ public final class StateStoreDefinitions {
                 Serdes.String(), Serdes.String());
     }
 
-    /** Stores the previous eventTime and temperature per (runId, deviceId). */
+    /** Stores the previous event timestamp and temperature for each (runId, deviceId). */
     public static StoreBuilder<KeyValueStore<String, String>> rapidChangeStoreBuilder() {
         return Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore(RAPID_CHANGE_STORE),

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Supervise B1-B3 execution and validate finalization evidence; never calculate metrics.
+"""Supervise B1-B4 execution and validate finalization evidence; never calculate metrics.
 
 CLI: python3 scripts/run-experiment.py --config PATH
 Or explicitly: python3 scripts/run-experiment.py --revalidate-run PATH/run-config.json
 JSON keys: runId, scenario, outputDirectory, commands (consumer/streams/producer
-argument arrays), optional startupTimeoutSeconds (120), shutdownTimeoutSeconds
-(45). Commands execute from the repository root. Existing Java option/value
+argument arrays; optional streams2 for B3), optional startupTimeoutSeconds (120),
+shutdownTimeoutSeconds (45). Commands execute from the repository root. Existing Java option/value
 interfaces are preserved; evidence flags, ordinary durations and fresh output
 paths are added or checked. No shell strings or shell -c commands are accepted.
 Outputs: coordination.jsonl, errors.log and per-component stdout/stderr logs,
@@ -14,6 +14,9 @@ finalization requires verified operational evidence. Revalidation is never autom
 """
 
 import argparse
+import importlib.util
+import queue
+import threading
 from contextlib import contextmanager
 import csv
 import re
@@ -50,19 +53,149 @@ def integer(value, name):
     return value
 
 
+def command_roles(config):
+    """Preserve legacy roles; only B3 may add the second Streams process."""
+    commands = config.get("commands")
+    roles = ROLES + (("streams2",) if isinstance(commands, dict) and "streams2" in commands else ())
+    if not isinstance(commands, dict) or set(commands) != set(roles):
+        raise CoordinationError("commands must identify consumer, streams and producer; only B3 may add streams2")
+    if "streams2" in commands and config.get("scenario") != "B3":
+        raise CoordinationError("streams2 is supported only for B3")
+    return roles
+
+
+def streams_roles(config):
+    return tuple(role for role in command_roles(config) if role in {"streams", "streams2"})
+
+
+def state_directory(value):
+    path = Path(text(value, "state-dir"))
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path.resolve()
+
+
+def verify_streams_pair(config):
+    """Check shared application settings without creating directories or processes."""
+    if "streams2" not in config["commands"]:
+        return
+    options = {}
+    for role in ("streams", "streams2"):
+        command = config["commands"][role]
+        options[role] = {command[i][2:]: command[i + 1] for i in range(len(command) - 1)
+                         if command[i].startswith("--")}
+        text(options[role].get("state-dir"), f"{role}: --state-dir")
+    first, second = options["streams"], options["streams2"]
+    if state_directory(first["state-dir"]) == state_directory(second["state-dir"]):
+        raise CoordinationError("streams and streams2 require distinct normalized state directories")
+    shared = {"bootstrap-servers", "application-id", "rule", "temperature-threshold",
+              "window-duration-ms", "count-threshold", "max-time-difference-ms",
+              "temperature-change-threshold"}
+    for name in shared:
+        if first.get(name) != second.get(name):
+            raise CoordinationError(f"streams2: --{name} must match streams")
+
+
+def validate_b4_settings(config):
+    """B4 minute eight is 480 seconds after the end of warm-up.
+
+    No timing, polling tolerance or Compose project is silently defaulted.
+    """
+    required = {"condition", "composeProject", "targetPartition", "warmUpSeconds",
+                "preFailureSeconds", "interruptionSeconds", "generationSecondsAfterWarmUp",
+                "observationSecondsAfterWarmUp", "drainSeconds", "metadataIntervalSeconds",
+                "metadataMaxGapMs", "metadataMaxAgeMs", "commandTimeoutSeconds",
+                "stopGraceSeconds", "restorationAttempts", "maxActionDelayMs"}
+    settings = config.get("b4")
+    if not isinstance(settings, dict) or set(settings) != required:
+        raise CoordinationError("b4 must contain exactly the documented B4 control/timing keys")
+    if not isinstance(settings["condition"], str) or settings["condition"] not in {"NO_FAILURE", "BROKER_FAILURE"}:
+        raise CoordinationError("b4.condition must be NO_FAILURE or BROKER_FAILURE")
+    if not isinstance(settings["composeProject"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", settings["composeProject"]):
+        raise CoordinationError("b4.composeProject must explicitly identify the existing deployment")
+    for key in required - {"condition", "composeProject"}:
+        integer(settings[key], "b4." + key)
+    if settings["targetPartition"] not in range(6):
+        raise CoordinationError("b4.targetPartition must be 0..5")
+    for key, expected in {"warmUpSeconds": 60, "preFailureSeconds": 120, "interruptionSeconds": 60,
+                          "generationSecondsAfterWarmUp": 480, "observationSecondsAfterWarmUp": 480}.items():
+        if settings[key] != expected:
+            raise CoordinationError(f"b4.{key} must be explicitly {expected} for this planning interpretation")
+    if settings["drainSeconds"] > 120:
+        raise CoordinationError("B4 drain must be bounded by 120 seconds")
+    for key in ("metadataIntervalSeconds", "metadataMaxGapMs", "metadataMaxAgeMs",
+                "commandTimeoutSeconds", "stopGraceSeconds", "restorationAttempts", "maxActionDelayMs"):
+        if settings[key] <= 0:
+            raise CoordinationError(f"b4.{key} must be positive")
+    if (settings["metadataIntervalSeconds"] > 60 or settings["restorationAttempts"] > 10
+            or settings["metadataMaxGapMs"] < settings["metadataIntervalSeconds"] * 1000
+            or settings["stopGraceSeconds"] >= settings["commandTimeoutSeconds"]
+            or settings["maxActionDelayMs"] >= settings["interruptionSeconds"] * 1000):
+        raise CoordinationError("contradictory B4 cadence, timeout, restoration or action-delay limits")
+    # One worker serializes queries/actions; cleanup covers a running job plus restoration.
+    bound = (9 + 5 * settings["restorationAttempts"]) * settings["commandTimeoutSeconds"] + 2
+    shutdown_timeout = config.get("shutdownTimeoutSeconds", 45)
+    if type(shutdown_timeout) not in {int, float} or not math.isfinite(shutdown_timeout) or shutdown_timeout < bound:
+        raise CoordinationError(f"B4 shutdownTimeoutSeconds must cover the bounded worker cleanup ({bound} s)")
+    return settings
+
+
+def experiment_durations(config):
+    if config.get("scenario") == "B4":
+        b4 = validate_b4_settings(config)
+        return b4["generationSecondsAfterWarmUp"], b4["drainSeconds"]
+    return 300, 120
+
+
+def validate_b4_commands(config):
+    """No alternate executables, topology flags or extra JVMs for B4."""
+    root = Path(__file__).resolve().parents[1]
+    options = {}
+    for role, script in {"consumer": "run-measurement-consumer.sh", "streams": "run-kafka-streams.sh",
+                         "producer": "run-sensor-producer.sh"}.items():
+        command = config["commands"][role]
+        first = next((i for i, arg in enumerate(command) if arg.startswith("--")), len(command))
+        if first != 1 or Path(command[0]).resolve() != root / "scripts" / script:
+            raise CoordinationError(f"B4 {role} requires the existing {script} executable")
+        options[role] = dict(zip(command[first::2], command[first + 1::2]))
+        if options[role].get("--bootstrap-servers") != "localhost:29092,localhost:39092,localhost:49092":
+            raise CoordinationError(f"B4 {role} requires the THREE_BROKERS bootstrap list")
+    producer, streams = options["producer"], options["streams"]
+    if producer.get("--acks", "all") != "all" or producer.get("--enable-idempotence", "true") != "true":
+        raise CoordinationError("B4 requires Producer acks=all and idempotence=true")
+    try:
+        correct = (float(producer["--target-events-per-second"]) == 100
+                   and streams["--rule"] == "RAPID_CHANGE"
+                   and int(streams["--max-time-difference-ms"]) == 5000
+                   and float(streams["--temperature-change-threshold"]) == 5.0)
+    except (KeyError, ValueError):
+        correct = False
+    if not correct:
+        raise CoordinationError("B4 requires MEDIUM=100 and RAPID_CHANGE parameters 5000/5.0")
+
+
+def b4_module():
+    """Import primitives only; never instantiate control during static revalidation."""
+    spec = importlib.util.spec_from_file_location("b4_control", Path(__file__).with_name("b4-control.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def validate(config):
     """Validate all launch inputs without creating files or processes."""
     if not isinstance(config, dict):
         raise CoordinationError("configuration must be an object")
     run_id = text(config.get("runId"), "runId")
-    if config.get("scenario") not in ("B1", "B2", "B3"):
-        raise CoordinationError("scenario must be B1, B2 or B3; B4 is unsupported")
+    if config.get("scenario") not in ("B1", "B2", "B3", "B4"):
+        raise CoordinationError("scenario must be B1, B2, B3 or B4")
     output = Path(text(config.get("outputDirectory"), "outputDirectory")).resolve()
     if output.exists():
         raise CoordinationError(f"output directory already exists: {output}")
     commands = config.get("commands")
-    if not isinstance(commands, dict) or set(commands) != set(ROLES):
-        raise CoordinationError("commands must identify consumer, streams and producer")
+    roles = command_roles(config)
+    if config["scenario"] == "B4":
+        validate_b4_settings(config)
     result = dict(config, outputDirectory=output, commands={})
     for key, default in (("startupTimeoutSeconds", 120), ("shutdownTimeoutSeconds", 45)):
         value = config.get(key, default)
@@ -73,7 +206,7 @@ def validate(config):
         "consumer": {"bootstrap-servers", "group-id", "auto-offset-reset", "result-csv-output", "readiness-stdout", "run-id"},
         "streams": {"bootstrap-servers", "application-id", "rule", "temperature-threshold",
                     "window-duration-ms", "count-threshold", "max-time-difference-ms",
-                    "temperature-change-threshold", "lifecycle-stdout"},
+                    "temperature-change-threshold", "lifecycle-stdout", "state-dir"},
         "producer": {"bootstrap-servers", "run-id", "random-seed", "initial-event-timestamp",
                      "timestamp-increment", "target-events-per-second", "warm-up-seconds",
                      "measurement-seconds", "acks", "enable-idempotence", "csv-output",
@@ -87,7 +220,11 @@ def validate(config):
                      "event-csv-output": str(output / "producer-events.csv"),
                      "run-config-output": str(output / "run-config.json")},
     }
-    for role in ROLES:
+    if config["scenario"] == "B4":
+        managed["producer"]["measurement-seconds"] = str(config["b4"]["generationSecondsAfterWarmUp"])
+    for role in roles:
+        base_role = "streams" if role == "streams2" else role
+        b3_streams = config["scenario"] == "B3" and base_role == "streams"
         command = commands[role]
         if not isinstance(command, list) or not command:
             raise CoordinationError(f"{role}: command must be a nonempty argument array")
@@ -104,22 +241,31 @@ def validate(config):
             raise CoordinationError(f"{role}: options require values")
         for option, value in zip(arguments[::2], arguments[1::2]):
             name = option.removeprefix("--")
-            if not option.startswith("--") or name not in allowed[role] or name in options or value.startswith("--"):
+            permitted = allowed[base_role] | ({"cpu-quota", "memory-max"} if b3_streams else set())
+            if not option.startswith("--") or name not in permitted or name in options or value.startswith("--"):
                 raise CoordinationError(f"{role}: unknown/duplicate option or missing value: {option}")
             options[name] = value
-        for name, value in managed[role].items():
+        if b3_streams:
+            launcher = Path(__file__).resolve().with_name("run-kafka-streams-b3.sh")
+            if first != 1 or Path(command[0]).resolve() != launcher:
+                raise CoordinationError(f"{role}: B3 requires the dedicated run-kafka-streams-b3.sh launcher")
+            expected = ("100%", "2G") if "streams2" in commands else ("200%", "4G")
+            if (options.get("cpu-quota"), options.get("memory-max")) != expected:
+                raise CoordinationError(f"{role}: B3 requires --cpu-quota {expected[0]} --memory-max {expected[1]}")
+            text(options.get("state-dir"), f"{role}: --state-dir")
+        for name, value in managed[base_role].items():
             if name in options and options[name] != value:
                 raise CoordinationError(f"{role}: --{name} must be {value}")
             options[name] = value
         required = {"consumer": ["bootstrap-servers", "group-id"],
                     "streams": ["bootstrap-servers", "application-id", "rule"],
                     "producer": ["bootstrap-servers", "random-seed", "initial-event-timestamp",
-                                 "timestamp-increment", "target-events-per-second"]}[role]
+                                 "timestamp-increment", "target-events-per-second"]}[base_role]
         for name in required:
             text(options.get(name), f"{role}: --{name}")
         if role == "consumer" and options.get("auto-offset-reset", "earliest") not in {"earliest", "latest"}:
             raise CoordinationError("invalid Consumer auto-offset-reset")
-        if role == "streams":
+        if role in {"streams", "streams2"}:
             rule_parameters = {"HIGH_TEMPERATURE": {"temperature-threshold"},
                                "HIGH_FREQUENCY": {"window-duration-ms", "count-threshold"},
                                "RAPID_CHANGE": {"max-time-difference-ms", "temperature-change-threshold"}}
@@ -150,6 +296,9 @@ def validate(config):
             if acks not in {"all", "-1", "0", "1"} or idem not in {"true", "false"} or (idem == "true" and acks not in {"all", "-1"}):
                 raise CoordinationError("invalid Producer acks/idempotence combination")
         result["commands"][role] = command[:first] + [item for name, value in options.items() for item in ("--" + name, value)]
+    verify_streams_pair(result)
+    if config["scenario"] == "B4":
+        validate_b4_commands(result)
     return result
 
 
@@ -224,6 +373,7 @@ def strict_json_object(pairs):
 
 
 CONFIGURATION_TYPES = {"streams": "KAFKA_STREAMS_CONFIGURATION",
+                       "streams2": "KAFKA_STREAMS_CONFIGURATION",
                        "consumer": "MEASUREMENT_CONSUMER_CONFIGURATION"}
 
 
@@ -233,8 +383,9 @@ def configuration_signature(event):
 
 
 def validate_configuration(event, role, config):
-    """Validate actual D.6.80 evidence against the validated launch arguments."""
-    if role not in CONFIGURATION_TYPES or event.get("evidenceType") != CONFIGURATION_TYPES[role]:
+    """Validate recorded configuration evidence against the process launch arguments."""
+    if (role not in config.get("commands", {}) or role not in CONFIGURATION_TYPES
+            or event.get("evidenceType") != CONFIGURATION_TYPES[role]):
         raise CoordinationError("configuration evidence from unexpected source process")
     observed = integer(event.get("observedAtEpochMs"), "configuration observedAtEpochMs")
     if observed >= 2**63:
@@ -247,7 +398,7 @@ def validate_configuration(event, role, config):
         raise CoordinationError("configuration unavailable must be a list of names")
     command = config.get("commands", {}).get(role, [])
     options = {command[i][2:]: command[i + 1] for i in range(len(command) - 1) if command[i].startswith("--")}
-    identity, property_name, option = (("applicationId", "application.id", "application-id") if role == "streams"
+    identity, property_name, option = (("applicationId", "application.id", "application-id") if role in {"streams", "streams2"}
                                        else ("groupId", "group.id", "group-id"))
     actual = text(event.get(identity), identity)
     if actual != options.get(option) or applied.get(property_name) != actual:
@@ -257,7 +408,11 @@ def validate_configuration(event, role, config):
             or any(not isinstance(v, str) or not v.strip() for v in brokers)
             or brokers != [v.strip() for v in options.get("bootstrap-servers", "").split(",")]):
         raise CoordinationError(f"{role}: conflicting/malformed bootstrap servers")
-    if role == "streams":
+    if role in {"streams", "streams2"}:
+        if "state-dir" in options:
+            actual_state = text(applied.get("state.dir"), f"{role}: effective state.dir")
+            if state_directory(actual_state) != state_directory(options["state-dir"]):
+                raise CoordinationError(f"{role}: effective state.dir conflicts with launch arguments")
         rule, parameters = event.get("rule"), event.get("ruleParameters")
         if rule != options.get("rule") or not isinstance(parameters, dict):
             raise CoordinationError("Streams configuration rule is missing/conflicting")
@@ -323,22 +478,28 @@ def verify_configuration_history(role, coordination, config):
 
 
 def operational_coverage(coordination, config, start, cutoff):
-    """Bounded reporting continuity, not proof of lossless observation.
+    """Validate the consumer's reporting cadence.
 
-    D.6.73 emits the first successful poll and then reports at >=1 s on the
-    monotonic clock, after processing the batch. The epoch sample is taken just
-    after poll returns. A cadence boundary can be crossed during the next poll,
-    whose configured timeout is 1 s. Accept at most cadence + one poll timeout
-    plus 1 ms for millisecond timestamp granularity (2001 ms), including
-    beginning and termination tails. No extra scheduler or processing grace is assumed: slower processing, suspension or clock jumps
-    must fail closed when the recorded evidence cannot meet this bound.
-    Kafka max.poll.interval.ms is unrelated to this observation evidence limit.
+    After the first successful poll, the consumer reports at intervals
+    of at least 1 second using a monotonic clock. Each report is generated
+    after processing the polled batch, with an epoch timestamp recorded
+    immediately after the poll returns.
+
+    The maximum accepted gap is 2001 ms: 1 second for the reporting
+    interval, 1 second for the configured poll timeout, and 1 ms for
+    timestamp resolution. This limit also applies at startup and shutdown.
+
+    Larger gaps are rejected because processing delays or clock changes
+    cannot be reliably distinguished from missing observations.
+    This validation is independent of Kafka's max.poll.interval.ms.
     """
     def require(condition, reason):
         if not condition:
             raise CoordinationError(reason)
 
     require(type(start) is int and type(cutoff) is int and start < cutoff, "coverage interval is unavailable")
+    if "streams2" in config["commands"]:
+        verify_b3_streams_history(coordination, config, start, cutoff)
     reporting_cadence_ms = 1000  # reportPoll's monotonic reporting threshold.
     poll_timeout_ms = 1000       # MeasurementKafkaConsumer.POLL_TIMEOUT.
     timestamp_granularity_tolerance_ms = 1
@@ -395,10 +556,10 @@ def operational_coverage(coordination, config, start, cutoff):
                     "Consumer exit does not match requested supervised shutdown")
     for record in records:
         event = record.get("evidence", {})
-        if record.get("component") == "streams" and event.get("evidenceType") == "KAFKA_STREAMS_STATE_CHANGED":
+        if record.get("component") in streams_roles(config) and event.get("evidenceType") == "KAFKA_STREAMS_STATE_CHANGED":
             at = event.get("observedAtEpochMs")
             require(type(at) is int, "Streams lifecycle timestamp is invalid")
-            if start <= at < cutoff:
+            if start <= at < cutoff and config.get("scenario") != "B4":
                 require(event.get("currentState") == "RUNNING" and event.get("status") == "READY",
                         "Streams left RUNNING before the observation cutoff")
     require(not any(e.get("evidenceType") == "FORCED_TERMINATION" for e in records),
@@ -411,6 +572,230 @@ def operational_coverage(coordination, config, start, cutoff):
             "maximumReportingGapMs": envelope,
             "pollProgressRecords": len(polls),
             "limitation": "Bounded operational reporting only; pauses up to the reporting bound and individual missing results remain possible."}
+
+
+def verify_b3_streams_history(coordination, config, start, cutoff):
+    """Require independent startup, continuity and supervised exits for both JVMs."""
+    verify_streams_pair(config)
+    roles = command_roles(config)
+    if set(coordination.get("components", {})) != set(roles):
+        raise CoordinationError("B3 component inventory does not match configured processes")
+    records = coordination.get("evidence", [])
+    producer_launch = next((i for i, e in enumerate(records)
+                            if e.get("evidenceType") == "PROCESS_STARTED"
+                            and e.get("component") == "producer"), -1)
+    for role in streams_roles(config):
+        launches = [i for i, e in enumerate(records) if e.get("component") == role
+                    and e.get("evidenceType") == "PROCESS_STARTED"]
+        if len(launches) != 1 or not launches[0] < producer_launch:
+            raise CoordinationError(f"{role}: independent launch before Producer is required")
+        launch = records[launches[0]]
+        if launch.get("command") != config["commands"][role]:
+            raise CoordinationError(f"{role}: recorded launch command conflicts")
+        states = [(i, e["evidence"]) for i, e in enumerate(records)
+                  if e.get("component") == role and e.get("evidenceType") == "COMPONENT_EVIDENCE"
+                  and e.get("evidence", {}).get("evidenceType") == "KAFKA_STREAMS_STATE_CHANGED"]
+        before = [(i, e) for i, e in states if launches[0] < i < producer_launch]
+        if (not before or before[-1][1].get("currentState") != "RUNNING"
+                or before[-1][1].get("status") != "READY"
+                or integer(before[-1][1].get("observedAtEpochMs"), "Streams READY timestamp") > start):
+            raise CoordinationError(f"{role}: latest state before Producer must be RUNNING/READY")
+        for i, event in states:
+            at = integer(event.get("observedAtEpochMs"), "Streams state timestamp")
+            if (i >= producer_launch and at < cutoff
+                    and (event.get("currentState") != "RUNNING" or event.get("status") != "READY")):
+                raise CoordinationError(f"{role}: Streams continuity was interrupted")
+        for kind in ("SHUTDOWN_REQUESTED", "PROCESS_EXITED"):
+            found = [e for e in records if e.get("component") == role and e.get("evidenceType") == kind]
+            if len(found) != 1 or integer(found[0].get("observedAtEpochMs"), kind) < cutoff:
+                raise CoordinationError(f"{role}: supervised {kind} after cutoff is required")
+            if kind == "PROCESS_EXITED":
+                code = found[0].get("exitCode")
+                if (found[0].get("requested") is not True or type(code) is not int
+                        or code != coordination["components"][role].get("exitCode")):
+                    raise CoordinationError(f"{role}: exit evidence conflicts with supervised shutdown")
+
+
+def verify_b4_evidence(coordination, config, timing):
+    """Read-only B4 evidence revalidation: no controller instantiation or commands."""
+    b4 = validate_b4_settings(config)
+    validate_b4_commands(config)
+    if coordination.get("b4") != b4:
+        raise CoordinationError("persisted B4 configuration differs from launch settings")
+    records = coordination.get("evidence", [])
+    declarations = [r for r in records if r.get("evidenceType") == "B4_CONFIGURATION"]
+    if len(declarations) != 1 or declarations[0].get("b4") != b4:
+        raise CoordinationError("one matching B4 configuration declaration required")
+    anchor = integer(timing.get("workloadStartEpochMs"), "B4 workload anchor")
+    observation = anchor + (60 + b4["observationSecondsAfterWarmUp"]) * 1000
+    cutoff = observation + b4["drainSeconds"] * 1000
+    timelines = [r for r in records if r.get("evidenceType") == "B4_TIMELINE"]
+    expected_timeline = dict(workloadStartEpochMs=anchor, warmUpDeadlineEpochMs=anchor + 60000,
+                             failurePlannedEpochMs=anchor + 180000, restartPlannedEpochMs=anchor + 240000,
+                             generationDeadlineEpochMs=timing.get("measurementDeadlineEpochMs"),
+                             observationDeadlineEpochMs=observation, drainCutoffEpochMs=cutoff)
+    if len(timelines) != 1 or any(timelines[0].get(k) != v for k, v in expected_timeline.items()):
+        raise CoordinationError("B4 explicit timeline differs from Producer-anchored deadlines")
+    reached = [r for r in records if r.get("evidenceType") == "B4_OBSERVATION_DEADLINE_REACHED"]
+    if len(reached) != 1 or reached[0].get("scheduledAtEpochMs") != observation:
+        raise CoordinationError("B4 active observation deadline was not demonstrably reached")
+    if integer(reached[0].get("observedAtEpochMs"), "B4 observation reached") < observation:
+        # Legacy monotonic-only markers can precede the epoch deadline. Never
+        # correct them or grant timing tolerance: require independent evidence
+        # through the full observation AND drain, plus successful Producer exit.
+        cutoffs = [r for r in records if r.get("evidenceType") == "OBSERVATION_CUTOFF_REACHED"]
+        exits = [r for r in records if r.get("evidenceType") == "PROCESS_EXITED"
+                 and r.get("component") == "producer"]
+        if (len(cutoffs) != 1 or cutoffs[0].get("drainCutoffEpochMs") != cutoff
+                or integer(cutoffs[0].get("observedAtEpochMs"), "B4 cutoff reached") < cutoff
+                or len(exits) != 1 or exits[0].get("exitCode") != 0
+                or exits[0].get("requested") is not False
+                or integer(exits[0].get("observedAtEpochMs"), "B4 Producer exit") < observation):
+            raise CoordinationError("B4 early observation marker lacks independent deadline/Producer evidence")
+        operational_coverage(coordination, config, anchor, cutoff)
+    closed = [r for r in records if r.get("evidenceType") == "B4_WORKER_CLOSED"]
+    if len(closed) != 1 or closed[0].get("pendingRestoration") is not False:
+        raise CoordinationError("B4 worker closure/restoration is unconfirmed")
+    if any(r.get("evidenceType") in {"B4_FAILURE", "B4_OPERATOR_RECOVERY_REQUIRED"} for r in records):
+        raise CoordinationError("B4 control or restoration failure recorded")
+    events = [r["evidence"] for r in records if r.get("evidenceType") == "B4_CONTROL_EVIDENCE"]
+    module = b4_module()
+    pins = [e for e in events if e.get("evidenceType") == "B4_DEPLOYMENT_PINNED"]
+    if len(pins) != 1 or set(pins[0].get("containers", {})) != set(module.BROKERS.values()):
+        raise CoordinationError("B4 three-broker deployment pinning evidence missing")
+    if set(pins[0].get("dataVolumes", {})) != set(module.BROKERS.values()):
+        raise CoordinationError("B4 data volume identity evidence missing")
+    samples = {topic: [] for topic in module.TOPICS}
+    latest_output, latest_partitions = {}, {}
+    selected, actions, commands = None, [], []
+    active_job = None
+    operations = []
+    for event in events:
+        kind = event.get("evidenceType")
+        at = integer(event.get("observedAtEpochMs"), "B4 evidence timestamp")
+        if kind == "B4_WORKER_DISPATCH":
+            if active_job is not None:
+                raise CoordinationError("overlapping B4 worker operations")
+            active_job = event.get("operation")
+            operations.append(active_job)
+            if active_job not in {"pin", "sample", "fault", "reference", "restart", "restore"}:
+                raise CoordinationError("unknown B4 worker operation")
+            if b4["condition"] == "NO_FAILURE" and active_job in {"fault", "restart", "restore"}:
+                raise CoordinationError("NO_FAILURE contains a broker action")
+        elif kind == "B4_WORKER_COMPLETED":
+            if active_job != event.get("operation") or event.get("status") != "SUCCEEDED" or event.get("error"):
+                raise CoordinationError("B4 worker operation incomplete or failed")
+            active_job = None
+        else:
+            if (event.get("runId") != config["runId"] or event.get("condition") != b4["condition"]
+                    or event.get("composeProject") != b4["composeProject"]
+                    or event.get("composeFile") != str(module.COMPOSE_FILE)):
+                raise CoordinationError("B4 evidence identity or deployment mismatch")
+        if kind in {"B4_METADATA_QUERY_FAILED", "B4_BROKER_ACTION_FAILED", "B4_RESTORATION_FAILED",
+                    "B4_RESTORATION_ATTEMPT_FAILED"}:
+            raise CoordinationError("B4 control/metadata evidence contains an unverified interval or failure")
+        if kind == "B4_COMMAND_RESULT":
+            command = event.get("command")
+            if not isinstance(command, list) or any(not isinstance(arg, str) for arg in command):
+                raise CoordinationError("invalid B4 command evidence")
+            commands.append(event)
+            if event.get("returnCode") != 0 or event.get("status") != "SUCCEEDED" or event.get("error"):
+                raise CoordinationError("failed B4 command evidence")
+            requested = integer(event.get("requestedAtEpochMs"), "B4 command request")
+            completed = integer(event.get("completedAtEpochMs"), "B4 command completion")
+            if not requested <= completed <= at:
+                raise CoordinationError("invalid B4 command chronology")
+            if "--topic" in command and "--describe" in command:
+                topic = command[command.index("--topic") + 1]
+                latest_output[topic] = event["stdout"]
+        elif kind == "B4_METADATA_SAMPLE":
+            topic = event.get("topic")
+            if topic not in samples or event.get("status") != "OBSERVED" or event.get("samplingGap"):
+                raise CoordinationError("invalid B4 metadata sample or sampling gap")
+            partitions = event.get("partitions")
+            if not isinstance(partitions, list) or len(partitions) != 6:
+                raise CoordinationError("B4 sample lacks six partitions")
+            observed = partitions[0].get("observedAtEpochMs")
+            parsed = module.parse_topic_metadata(latest_output.get(topic, ""), topic, observed)
+            if parsed != partitions or observed > at:
+                raise CoordinationError("B4 parsed metadata differs from recorded CLI evidence")
+            samples[topic].append(observed)
+            latest_partitions[topic] = parsed
+        elif kind == "B4_BROKER_SELECTED":
+            if selected is not None:
+                raise CoordinationError("ambiguous B4 target selection")
+            selected = event
+            if "sensor-events" not in latest_partitions:
+                raise CoordinationError("B4 selection lacks preceding metadata sample")
+            expected = latest_partitions["sensor-events"][b4["targetPartition"]]
+            broker = event.get("selectedBrokerId")
+            if (event.get("selectionMetadata") != expected or broker != expected["leaderBrokerId"]
+                    or event.get("selectedService") != module.broker_service(broker)
+                    or event.get("partition") != b4["targetPartition"]):
+                raise CoordinationError("B4 leader selection conflicts with fresh sensor-events metadata")
+        elif kind in {"B4_BROKER_ACTION_REQUESTED", "B4_BROKER_ACTION_CONFIRMED"}:
+            actions.append(event)
+    if active_job is not None:
+        raise CoordinationError("B4 worker operation never completed")
+    for topic, times in samples.items():
+        if (not times or times[0] > anchor + b4["metadataMaxGapMs"]
+                or cutoff - times[-1] > b4["metadataMaxGapMs"]
+                or any(not 0 <= later - earlier <= b4["metadataMaxGapMs"]
+                       for earlier, later in zip(times, times[1:]))):
+            raise CoordinationError(f"B4 {topic}: incomplete metadata sampling coverage")
+    expected_selection = "fault" if b4["condition"] == "BROKER_FAILURE" else "reference"
+    if (operations.count("pin") != 1 or operations.count(expected_selection) != 1
+            or operations.count("restart") != (1 if b4["condition"] == "BROKER_FAILURE" else 0)
+            or "sample" not in operations or selected is None):
+        raise CoordinationError("B4 scheduled pinning, selection, monitoring or restart is incomplete")
+    if (not 0 <= selected["observedAtEpochMs"] - anchor - 180000 <= b4["maxActionDelayMs"]
+            or not 0 <= selected["observedAtEpochMs"] - selected["metadataObservedAtEpochMs"] <= b4["metadataMaxAgeMs"]):
+        raise CoordinationError("B4 target/reference selection missed its deadline or used stale metadata")
+    requests = [e for e in actions if e["evidenceType"] == "B4_BROKER_ACTION_REQUESTED"]
+    confirmations = [e for e in actions if e["evidenceType"] == "B4_BROKER_ACTION_CONFIRMED"]
+    control_commands = [e for e in commands if any(op in e["command"] for op in ("stop", "start"))]
+    if b4["condition"] == "NO_FAILURE":
+        if actions or control_commands:
+            raise CoordinationError("NO_FAILURE contains broker-stop/restart evidence")
+    else:
+        if selected is None or [e.get("action") for e in requests] != ["stop", "start"] or len(confirmations) != 2:
+            raise CoordinationError("B4 requires exactly one verified stop and restart")
+        service, broker = selected["selectedService"], selected["selectedBrokerId"]
+        for action, offset, state in (("stop", 180, "exited"), ("start", 240, "running")):
+            request = next(e for e in requests if e["action"] == action)
+            matches = [e for e in confirmations if e.get("action") == action]
+            if len(matches) != 1:
+                raise CoordinationError("ambiguous B4 action confirmation")
+            confirmed = matches[0]
+            planned = anchor + offset * 1000
+            delay = request["observedAtEpochMs"] - planned
+            if not 0 <= delay <= b4["maxActionDelayMs"]:
+                raise CoordinationError("B4 action missed its explicit scheduling tolerance")
+            if (request.get("selectedBrokerId") != broker or request.get("selectedService") != service
+                    or confirmed.get("selectedBrokerId") != broker or confirmed.get("selectedService") != service
+                    or request.get("containerId") != pins[0]["containers"][service]
+                    or confirmed.get("containerId") != request["containerId"]
+                    or confirmed.get("dataVolume") != pins[0]["dataVolumes"][service]
+                    or confirmed.get("containerState") != state or confirmed.get("returnCode") != 0
+                    or confirmed.get("status") != "CONFIRMED"
+                    or not request["observedAtEpochMs"] <= confirmed["requestedAtEpochMs"] <= confirmed["completedAtEpochMs"] <= confirmed["observedAtEpochMs"]):
+                raise CoordinationError("B4 action identity, outcome or chronology is unverified")
+            actual = [e for e in control_commands if action in e["command"]]
+            expected_command = ["docker", "compose", "--project-name", b4["composeProject"], "-f", str(module.COMPOSE_FILE), action]
+            expected_command += ["--timeout", str(b4["stopGraceSeconds"]), service] if action == "stop" else [service]
+            if (len(actual) != 1 or actual[0]["command"] != expected_command
+                    or actual[0]["requestedAtEpochMs"] != confirmed["requestedAtEpochMs"]
+                    or actual[0]["completedAtEpochMs"] != confirmed["completedAtEpochMs"]):
+                raise CoordinationError("B4 action confirmation lacks matching service-specific command evidence")
+            if action == "stop" and not 0 <= confirmed["requestedAtEpochMs"] - selected["metadataObservedAtEpochMs"] <= b4["metadataMaxAgeMs"]:
+                raise CoordinationError("B4 target metadata was stale at broker-stop dispatch")
+    # Independent supervised exits remain mandatory even during expected failover.
+    for role in ROLES:
+        exits = [e for e in records if e.get("evidenceType") == "PROCESS_EXITED" and e.get("component") == role]
+        if len(exits) != 1 or exits[0].get("exitCode") != coordination["components"][role].get("exitCode"):
+            raise CoordinationError(f"B4 {role}: process exit evidence is missing/conflicting")
+        if role != "producer" and (exits[0].get("requested") is not True or exits[0]["observedAtEpochMs"] < cutoff):
+            raise CoordinationError(f"B4 {role}: premature/unexpected exit")
 
 
 def validate_finalization(data, coordination, config):
@@ -428,11 +813,19 @@ def validate_finalization(data, coordination, config):
     def epoch(value):
         return type(value) is int and 0 <= value < 2**63
 
-    check("scenario", config.get("scenario") in {"B1", "B2", "B3"}, "explicit B1/B2/B3 scenario required")
+    check("scenario", config.get("scenario") in {"B1", "B2", "B3", "B4"}, "explicit B1/B2/B3 scenario required")
+    measurement_seconds, drain_seconds = experiment_durations(config)
+    if "streams2" in config.get("commands", {}):
+        try:
+            command_roles(config)
+            verify_streams_pair(config)
+            check("b3StreamsPair", True, "")
+        except (CoordinationError, TypeError, ValueError) as error:
+            check("b3StreamsPair", False, str(error))
     configuration = data.get("configuration") or {}
     producer = configuration.get("producer") or {}
     options = {}
-    for role in ROLES:
+    for role in command_roles(config):
         command = config.get("commands", {}).get(role, [])
         options[role] = {command[i][2:]: command[i + 1] for i in range(len(command) - 1)
                          if command[i].startswith("--")}
@@ -454,15 +847,15 @@ def validate_finalization(data, coordination, config):
     matches = matches and kafka.get("acks") == expected.get("acks", "all")
     matches = matches and kafka.get("enable.idempotence") == expected.get("enable-idempotence", "true")
     check("producerConfiguration", matches, "persisted effective Producer configuration is missing/conflicting")
-    for role in ("streams", "consumer"):
+    for role in streams_roles(config) + ("consumer",):
         try:
             verify_configuration_history(role, coordination, config)
             check(role + "EffectiveConfiguration", True, "")
         except (CoordinationError, TypeError, ValueError) as error:
             check(role + "EffectiveConfiguration", False, str(error))
     durations = data.get("phaseDurationsMs") or {}
-    check("ordinaryDurations", durations.get("warmUp") == 60000 and durations.get("measurement") == 300000,
-          "persisted warm-up/measurement must be 60000/300000 ms")
+    check("ordinaryDurations", durations.get("warmUp") == 60000 and durations.get("measurement") == measurement_seconds * 1000,
+          f"persisted warm-up/measurement must be 60000/{measurement_seconds * 1000} ms")
     events = coordination.get("evidence", [])
     component_events = [(e.get("component"), e.get("evidence", {})) for e in events
                         if e.get("evidenceType") == "COMPONENT_EVIDENCE"]
@@ -474,13 +867,14 @@ def validate_finalization(data, coordination, config):
                    and epoch(t.get("sampleSpanNs"))
                    and all(anchors.get(k) == t.get(k) for k in ("workloadStartNs", "workloadStartEpochMs", "sampleSpanNs"))
                    and t.get("warmUpDurationNs") == 60_000_000_000
-                   and t.get("measurementDurationNs") == 300_000_000_000
+                   and t.get("measurementDurationNs") == measurement_seconds * 1_000_000_000
                    and t.get("measurementStartEpochMs") == anchor + 60000
-                   and t.get("measurementDeadlineEpochMs") == anchor + 360000
+                   and t.get("measurementDeadlineEpochMs") == anchor + (60 + measurement_seconds) * 1000
                    and all(scheduled.get(k) == t.get(k) for k in ("measurementStartEpochMs", "measurementDeadlineEpochMs")))
     check("clockAndBoundaries", bool(clock_valid), "one actual timing event must match persisted anchors and fixed boundaries")
     start = t.get("workloadStartEpochMs")
-    for role, kind in (("consumer", "MEASUREMENT_CONSUMER_READINESS"), ("streams", "KAFKA_STREAMS_STATE_CHANGED")):
+    for role, kind in (("consumer", "MEASUREMENT_CONSUMER_READINESS"),) + tuple(
+            (role, "KAFKA_STREAMS_STATE_CHANGED") for role in streams_roles(config)):
         ready = [(index, e) for index, e in enumerate(events)
                  if e.get("component") == role and e.get("evidence", {}).get("evidenceType") == kind
                  and e["evidence"].get("status") == "READY"]
@@ -506,14 +900,20 @@ def validate_finalization(data, coordination, config):
                         and epoch(e.get("observedAtEpochMs")) and epoch(start)
                         and e["observedAtEpochMs"] >= start
                         and e.get("currentState") in {"REBALANCING", "ERROR", "PENDING_ERROR"})]
+    if config.get("scenario") == "B4":
+        invalidations = [e for e in invalidations if e.get("status") == "FAILED"
+                         or e.get("failure") is not None
+                         or e.get("currentState") in {"ERROR", "PENDING_ERROR"}]
     check("runtimeContinuity", not invalidations, "recorded assignment/readiness interruption or component failure")
     drain = coordination.get("drain", {})
     deadline = t.get("measurementDeadlineEpochMs")
     cutoff = drain.get("scheduledCutoffEpochMs")
     reached = drain.get("cutoffReachedObservedAtEpochMs")
-    check("drainCutoff", epoch(deadline) and epoch(cutoff) and cutoff == deadline + 120000
+    check("drainCutoff", epoch(deadline) and epoch(cutoff) and cutoff == deadline + drain_seconds * 1000
           and drain.get("scheduledStartEpochMs") == deadline and epoch(reached) and reached >= cutoff,
-          "fixed measurement deadline plus 120000 ms drain was not demonstrably reached")
+          ("B4 generation deadline plus configured drain was not demonstrably reached"
+           if config.get("scenario") == "B4" else
+           "fixed measurement deadline plus 120000 ms drain was not demonstrably reached"))
     last_poll = (coordination.get("lastPollProgress") or {}).get("evidence", {})
     check("pollProgress", last_poll.get("evidenceType") == "MEASUREMENT_CONSUMER_POLL_PROGRESS"
           and last_poll.get("status") == "READY" and type(last_poll.get("successfulPolls")) is int
@@ -527,7 +927,7 @@ def validate_finalization(data, coordination, config):
     required = {"consumer": {"MEASUREMENT_CONSUMER_POLLING_TERMINATED": "REQUESTED_SHUTDOWN",
                              "MEASUREMENT_CONSUMER_KAFKA_CLOSED": "CLOSED",
                              "MEASUREMENT_CONSUMER_RESULT_CSV_CLOSED": "CLOSED"},
-                "streams": {"KAFKA_STREAMS_CLOSE_RESULT": "CLOSED"}}
+                **{role: {"KAFKA_STREAMS_CLOSE_RESULT": "CLOSED"} for role in streams_roles(config)}}
     for role, kinds in required.items():
         code = coordination.get("components", {}).get(role, {}).get("exitCode")
         check(role + "Exit", type(code) is int, f"{role} actual process exit is missing")
@@ -537,7 +937,8 @@ def validate_finalization(data, coordination, config):
             valid = valid and epoch(found[0].get("observedAtEpochMs")) and epoch(cutoff) and found[0]["observedAtEpochMs"] >= cutoff
             if kind.endswith("POLLING_TERMINATED"):
                 valid = valid and found[0].get("pollingInvoked") is True
-            check(kind, bool(valid), f"successful actual {kind} after cutoff is missing/conflicting")
+            check((role + ":" if role == "streams2" else "") + kind, bool(valid),
+                  f"{role}: successful actual {kind} after cutoff is missing/conflicting")
     observed = data.get("observed") or {}
     publication_only = (bool(data.get("failures"))
                         and any(f.get("category") == "PUBLICATION_FAILURE" for f in data["failures"])
@@ -553,6 +954,12 @@ def validate_finalization(data, coordination, config):
     producer_code = coordination.get("components", {}).get("producer", {}).get("exitCode")
     check("producerExit", type(producer_code) is int and (producer_code == 0 or publication_only),
           "Producer exit is unobserved or failed for a reason other than recorded publication outcomes")
+    if config.get("scenario") == "B4":
+        try:
+            verify_b4_evidence(coordination, config, t)
+            check("b4ControlAndCoverage", True, "")
+        except (CoordinationError, KeyError, TypeError, ValueError) as error:
+            check("b4ControlAndCoverage", False, str(error))
     validate_raw_observations(config, checks)
     blockers = [c["reason"] for c in checks if c["status"] == "BLOCKED"]
     return {"status": "VERIFIED" if not blockers else "BLOCKED", "checks": checks,
@@ -692,23 +1099,25 @@ def revalidate_run(path):
             if (ownership.get("owner") != "COORDINATOR"
                     or ownership.get("locking") != "POSIX_RECORD_LOCK_JAVA_INTEROPERABILITY_VERIFIED"):
                 raise CoordinationError("recorded compatible coordinator ownership is required")
+            roles = command_roles({"scenario": data.get("scenario"),
+                                   "commands": coordination["components"]})
             commands, exits = {}, {}
             for event in coordination["evidence"]:
                 kind, role = event.get("evidenceType"), event.get("component")
                 if kind == "PROCESS_STARTED":
-                    if role not in ROLES or role in commands:
+                    if role not in roles or role in commands:
                         raise CoordinationError("ambiguous component launch evidence")
                     command = event.get("command")
                     if not isinstance(command, list) or not command or any(not isinstance(arg, str) for arg in command):
                         raise CoordinationError("invalid component launch arguments")
                     commands[role] = command
                 elif kind == "PROCESS_EXITED":
-                    if role not in ROLES or role in exits or type(event.get("exitCode")) is not int:
+                    if role not in roles or role in exits or type(event.get("exitCode")) is not int:
                         raise CoordinationError("ambiguous component exit evidence")
                     exits[role] = event["exitCode"]
-            if set(commands) != set(ROLES) or set(exits) != set(ROLES):
+            if set(commands) != set(roles) or set(exits) != set(roles):
                 raise CoordinationError("all original component launches and exits must be recorded")
-            for role in ROLES:
+            for role in roles:
                 component = coordination["components"][role]
                 if component.get("status") != "EXIT_OBSERVED" or component.get("exitCode") != exits[role]:
                     raise CoordinationError(f"{role}: completion evidence conflicts with recorded exit")
@@ -723,6 +1132,10 @@ def revalidate_run(path):
                     raise CoordinationError("recorded input paths differ from the existing run")
             config = {"runId": run_id, "scenario": data.get("scenario"),
                       "outputDirectory": output.parent, "commands": commands}
+            if config["scenario"] == "B4":
+                config["b4"] = coordination["b4"]
+                config["shutdownTimeoutSeconds"] = coordination["b4ShutdownTimeoutSeconds"]
+            verify_streams_pair(config)
             validation = validate_finalization(data, coordination, config)
         except (KeyError, TypeError, AttributeError) as error:
             raise CoordinationError(f"incomplete completed-run evidence: {error}") from error
@@ -768,6 +1181,9 @@ def persist_coordination(config, processes, coordination, verify=verify_lock_com
         if "scenario" in data and data["scenario"] != config["scenario"]:
             raise CoordinationError("metadata scenario conflicts with coordinator")
         data["scenario"] = config["scenario"]
+        if config["scenario"] == "B4":
+            coordination["b4"] = dict(config["b4"])
+            coordination["b4ShutdownTimeoutSeconds"] = config["shutdownTimeoutSeconds"]
         data["coordination"] = dict(coordination, ownership={
             "owner": "COORDINATOR", "handoffObservedAtEpochMs": processes.epoch_ms(),
             "producerExitCode": processes.poll("producer"),
@@ -858,6 +1274,7 @@ class Coordinator:
         self.config, self.processes, self.journal, self.errors = config, processes, journal, errors
         self.started, self.requested, self.exits = set(), set(), {}
         self.consumer_ready = self.streams_ready = False
+        self.streams_readiness = {role: False for role in streams_roles(config)}
         self.timing = None
         self.cutoff = None
         self.closure_evidence = set()
@@ -912,12 +1329,15 @@ class Coordinator:
             anchor = event["workloadStartEpochMs"]
             if anchor > self.processes.epoch_ms():
                 raise CoordinationError("Producer clock anchor is later than receipt; clock consistency requires review")
-            if (event["warmUpDurationNs"] != 60_000_000_000 or event["measurementDurationNs"] != 300_000_000_000
+            measurement_seconds, drain_seconds = experiment_durations(self.config)
+            if (event["warmUpDurationNs"] != 60_000_000_000 or event["measurementDurationNs"] != measurement_seconds * 1_000_000_000
                     or event["measurementStartEpochMs"] != anchor + 60_000
-                    or event["measurementDeadlineEpochMs"] != anchor + 360_000):
-                raise CoordinationError("Producer timing does not describe ordinary B1-B3 intervals")
+                    or event["measurementDeadlineEpochMs"] != anchor + (60 + measurement_seconds) * 1000):
+                raise CoordinationError("Producer timing conflicts with explicit B4 generation intervals"
+                                        if self.config["scenario"] == "B4" else
+                                        "Producer timing does not describe ordinary B1-B3 intervals")
             self.timing = event
-            self.cutoff = event["measurementDeadlineEpochMs"] + 120_000
+            self.cutoff = event["measurementDeadlineEpochMs"] + drain_seconds * 1000
             remaining = (self.cutoff - self.processes.epoch_ms()) / 1000
             if remaining <= 0:
                 raise CoordinationError("Producer timing arrived after the observation cutoff")
@@ -956,19 +1376,20 @@ class Coordinator:
             elif kind in {"MEASUREMENT_CONSUMER_PARTITIONS_REVOKED", "MEASUREMENT_CONSUMER_PARTITIONS_LOST"}:
                 if any(p.get("topic") == "sensor-results" for p in event.get("affectedPartitions", [])):
                     self.consumer_ready = False
-                    raise CoordinationError("result assignment interrupted; coverage requires later review")
+                    if self.config["scenario"] != "B4":
+                        raise CoordinationError("result assignment interrupted; coverage requires later review")
             elif kind == "MEASUREMENT_CONSUMER_POLL_PROGRESS":
                 if status not in {"READY", "NOT_READY"}:
                     raise CoordinationError("invalid Consumer polling status")
                 if status != "READY":
                     self.consumer_ready = False
-                    if "producer" in self.started:
+                    if "producer" in self.started and self.config["scenario"] != "B4":
                         raise CoordinationError("Consumer readiness was invalidated during workload")
             elif kind in {"MEASUREMENT_CONSUMER_POLLING_TERMINATED", "MEASUREMENT_CONSUMER_KAFKA_CLOSED",
                           "MEASUREMENT_CONSUMER_RESULT_CSV_CLOSED"}:
                 if role not in self.requested or status not in {"REQUESTED_SHUTDOWN", "CLOSED", "NOT_STARTED"}:
                     raise CoordinationError(f"unexpected Consumer termination/cleanup: {status}")
-                self.closure_evidence.add(kind)
+                self.closure_evidence.add((role, kind))
             else:
                 raise CoordinationError("unknown Consumer evidence type")
         else:
@@ -977,19 +1398,27 @@ class Coordinator:
                     raise CoordinationError("invalid Streams lifecycle status")
                 if event.get("currentState") in {"ERROR", "PENDING_ERROR"}:
                     raise CoordinationError("Streams runtime failure state")
-                self.streams_ready = status == "READY" and event.get("currentState") == "RUNNING"
-                if status == "READY" and not self.streams_ready:
+                self.streams_readiness[role] = status == "READY" and event.get("currentState") == "RUNNING"
+                self.streams_ready = all(self.streams_readiness.values())
+                if status == "READY" and not self.streams_readiness[role]:
                     raise CoordinationError("Streams READY without RUNNING")
                 if status == "FAILED":
-                    raise CoordinationError("Streams runtime failure")
+                    raise CoordinationError(f"{role}: Streams runtime failure")
+                if ("streams2" in self.streams_readiness and "producer" in self.started
+                        and role not in self.requested and not self.streams_readiness[role]):
+                    raise CoordinationError(f"{role}: Streams left RUNNING during workload")
             elif kind == "KAFKA_STREAMS_STARTUP":
+                self.streams_readiness[role] = False
+                self.streams_ready = False
                 if status != "NOT_READY":
                     raise CoordinationError("premature Streams readiness")
+                if "streams2" in self.streams_readiness and "producer" in self.started:
+                    raise CoordinationError(f"{role}: unexpected startup during workload")
             elif kind in {"KAFKA_STREAMS_SHUTDOWN_REQUESTED", "KAFKA_STREAMS_CLOSE_RESULT"}:
                 if role not in self.requested or status not in {"SHUTDOWN_REQUESTED", "CLOSED"}:
                     raise CoordinationError(f"unexpected Streams shutdown/cleanup: {status}")
                 if kind == "KAFKA_STREAMS_CLOSE_RESULT":
-                    self.closure_evidence.add(kind)
+                    self.closure_evidence.add((role, kind))
             else:
                 raise CoordinationError("Streams failure or unknown evidence")
 
@@ -1012,7 +1441,7 @@ class Coordinator:
             self.step(min(0.1, deadline - self.processes.now()))
 
     def shutdown(self):
-        for role in ("producer", "consumer", "streams"):
+        for role in ("producer", "consumer") + streams_roles(self.config):
             if role in self.started and self.processes.poll(role) is None:
                 self.requested.add(role)
                 self.record("SHUTDOWN_REQUESTED", component=role)
@@ -1045,10 +1474,10 @@ class Coordinator:
         required = {
             "consumer": {"MEASUREMENT_CONSUMER_POLLING_TERMINATED", "MEASUREMENT_CONSUMER_KAFKA_CLOSED",
                          "MEASUREMENT_CONSUMER_RESULT_CSV_CLOSED"},
-            "streams": {"KAFKA_STREAMS_CLOSE_RESULT"},
+            **{role: {"KAFKA_STREAMS_CLOSE_RESULT"} for role in streams_roles(self.config)},
         }
         for role, evidence in required.items():
-            if role in self.requested and not evidence.issubset(self.closure_evidence):
+            if role in self.requested and not {(role, kind) for kind in evidence}.issubset(self.closure_evidence):
                 failures.append(f"{role}: successful cleanup evidence is incomplete; exit code alone is insufficient")
         return failures
 
@@ -1060,7 +1489,8 @@ class Coordinator:
         try:
             self.launch("consumer")
             self.wait_for(lambda: self.consumer_ready, "Consumer READY")
-            self.launch("streams")
+            for role in streams_roles(self.config):
+                self.launch(role)
             self.wait_for(lambda: self.consumer_ready and self.streams_ready, "Streams RUNNING and Consumer READY")
             self.launch("producer")
             self.wait_for(lambda: self.timing is not None, "Producer workload timing")
@@ -1091,7 +1521,7 @@ class Coordinator:
                                   if e["evidenceType"] == "OBSERVATION_CUTOFF_REACHED"), None)},
                     "components": {role: {"exitCode": self.exits.get(role),
                                           "status": "EXIT_OBSERVED" if role in self.exits else "NOT_RECORDED"}
-                                   for role in ROLES},
+                                   for role in command_roles(self.config)},
                     "evidence": self.metadata_events,
                     "lastPollProgress": getattr(self, "last_poll", None),
                     "configurationEvidence": dict(self.configuration_evidence),
@@ -1110,6 +1540,210 @@ class Coordinator:
         return 1 if failures else 0
 
 
+class B4Worker:
+    """One owned non-daemon worker; only the coordinator thread writes journals."""
+    def __init__(self, config):
+        self.config = config
+        self.events = queue.Queue()
+        self.jobs = queue.Queue(maxsize=1)
+        self.busy = False
+        b4 = config["b4"]
+        self.control = b4_module().BrokerControl(config["runId"], b4["condition"], b4["composeProject"],
+                                                b4["commandTimeoutSeconds"], emit=self.events.put)
+        self.thread = threading.Thread(target=self._work, name="b4-control", daemon=False)
+        self.thread.start()
+
+    def submit(self, operation, scheduled_epoch=None):
+        if self.busy:
+            raise CoordinationError("conflicting B4 worker operations")
+        self.busy = True
+        self.jobs.put_nowait((operation, scheduled_epoch))
+
+    def _work(self):
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                return
+            operation, scheduled = job
+            b4 = self.config["b4"]
+            now = time.time_ns() // 1_000_000
+            if operation in {"fault", "restart"} and scheduled is not None:
+                # The coordinator's monotonic/epoch mapping can wake us early.
+                # Recheck epoch after every sleep, including partial wake-ups.
+                while now < scheduled:
+                    time.sleep((scheduled - now) / 1000)
+                    now = time.time_ns() // 1_000_000
+            self.events.put(dict(evidenceType="B4_WORKER_DISPATCH", operation=operation,
+                                 observedAtEpochMs=now, scheduledAtEpochMs=scheduled,
+                                 schedulingDelayMs=None if scheduled is None else now - scheduled))
+            error = None
+            try:
+                if operation in {"fault", "restart", "restore"} and b4["condition"] != "BROKER_FAILURE":
+                    raise CoordinationError("NO_FAILURE cannot dispatch broker actions")
+                if operation in {"fault", "restart"} and (scheduled is None
+                        or not 0 <= now - scheduled <= b4["maxActionDelayMs"]):
+                    raise CoordinationError("B4 broker action missed its declared scheduling tolerance")
+                if operation == "pin":
+                    self.control.pin_deployment()
+                elif operation == "sample":
+                    for topic in ("sensor-events", "sensor-results", "sensor-alerts"):
+                        self.control.sample_metadata(topic, b4["metadataMaxGapMs"])
+                elif operation in {"fault", "reference"}:
+                    self.control.select_leader(b4["targetPartition"], b4["metadataMaxAgeMs"], b4["metadataMaxGapMs"])
+                    if operation == "fault":
+                        self.control.stop_selected(b4["stopGraceSeconds"])
+                elif operation == "restart":
+                    self.control.start_selected()
+                elif operation == "restore":
+                    record = self.control.restore_selected(b4["restorationAttempts"])
+                    if record.get("status") == "FAILED":
+                        raise CoordinationError("B4 broker restoration failed; manual inspection required")
+                else:
+                    raise CoordinationError("unknown B4 worker operation")
+            except Exception as failure:
+                error = f"{type(failure).__name__}: {failure}"
+            self.events.put(dict(evidenceType="B4_WORKER_COMPLETED", operation=operation,
+                                 observedAtEpochMs=time.time_ns() // 1_000_000,
+                                 status="SUCCEEDED" if error is None else "FAILED", error=error))
+
+    def drain(self):
+        records = []
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                return records
+            if event["evidenceType"] == "B4_WORKER_COMPLETED":
+                self.busy = False
+            records.append(event)
+
+    def close(self):
+        if self.busy:
+            raise CoordinationError("B4 operation still in progress; restoration requires manual inspection")
+        self.jobs.put_nowait(None)
+        self.thread.join(timeout=1)
+        if self.thread.is_alive():
+            raise CoordinationError("B4 worker termination was not confirmed")
+
+
+class B4Coordinator(Coordinator):
+    """B4-only scheduling; application supervision stays in Coordinator."""
+    def __init__(self, config, processes, journal, errors):
+        super().__init__(config, processes, journal, errors)
+        self.worker = None
+        self.b4_failures = []
+        self.b4_stopping = False
+        self.b4_fault_submitted = self.b4_restart_submitted = False
+        self.b4_observation_reached = False
+        self.b4_timeline_recorded = False
+        self.next_sample = None
+
+    def run(self):
+        self.record("B4_CONFIGURATION", b4=dict(self.config["b4"]),
+                    timingInterpretation="480 seconds of active observation AFTER 60-second warm-up; review required")
+        try:
+            self.worker = B4Worker(self.config)
+            self.worker.submit("pin")
+            self.wait_for(lambda: not self.worker.busy, "B4 deployment pinning")
+        except (Exception, KeyboardInterrupt) as error:
+            self.b4_failures.append(f"B4 preflight failed: {error}")
+            failures = self.shutdown()
+            for failure in failures:
+                self.record("B4_FAILURE", message=failure)
+                self.errors.write(f"[b4] {failure}\n")
+            return 1
+        return super().run()
+
+    def step(self, timeout=0.1, stopping=False):
+        super().step(timeout, stopping)
+        if self.worker is None:
+            return
+        for event in self.worker.drain():
+            self.record("B4_CONTROL_EVIDENCE", evidence=event)
+            if event["evidenceType"] == "B4_WORKER_COMPLETED" and event["status"] != "SUCCEEDED":
+                self.b4_failures.append(event["error"])
+                if not self.b4_stopping:
+                    raise CoordinationError(event["error"])
+        if self.b4_stopping or self.timing is None:
+            return
+        b4 = self.config["b4"]
+        anchor = self.timing["workloadStartEpochMs"]
+        if not self.b4_timeline_recorded:
+            self.record("B4_TIMELINE", workloadStartEpochMs=anchor,
+                        warmUpDeadlineEpochMs=anchor + 60000,
+                        failurePlannedEpochMs=anchor + 180000,
+                        restartPlannedEpochMs=anchor + 240000,
+                        generationDeadlineEpochMs=self.timing["measurementDeadlineEpochMs"],
+                        observationDeadlineEpochMs=anchor + (60 + b4["observationSecondsAfterWarmUp"]) * 1000,
+                        drainCutoffEpochMs=self.cutoff)
+            self.b4_timeline_recorded = True
+        now = self.processes.now()
+        # Reuse the Producer-derived monotonic/epoch mapping already established by handle().
+        elapsed = now - (self.stop_at - (self.cutoff - anchor) / 1000)
+        observation = 60 + b4["observationSecondsAfterWarmUp"]
+        observation_epoch = anchor + observation * 1000
+        observed_epoch = self.processes.epoch_ms()
+        # As at the drain cutoff, the initial clock mapping is only an estimate.
+        # Both clocks must reach the deadline before recording it.
+        if elapsed >= observation and observed_epoch >= observation_epoch and not self.b4_observation_reached:
+            self.record("B4_OBSERVATION_DEADLINE_REACHED", scheduledAtEpochMs=observation_epoch,
+                        schedulingDelayMs=observed_epoch - observation_epoch)
+            self.b4_observation_reached = True
+        if self.worker.busy:
+            return
+        failure_offset = 60 + b4["preFailureSeconds"]
+        restart_offset = failure_offset + b4["interruptionSeconds"]
+        if elapsed >= failure_offset and not self.b4_fault_submitted:
+            operation = "fault" if b4["condition"] == "BROKER_FAILURE" else "reference"
+            self.worker.submit(operation, anchor + failure_offset * 1000)
+            self.b4_fault_submitted = True
+            return
+        if b4["condition"] == "BROKER_FAILURE":
+            if elapsed >= restart_offset and not self.b4_restart_submitted:
+                if not self.b4_fault_submitted:
+                    raise CoordinationError("B4 restart cannot precede fault")
+                self.worker.submit("restart", anchor + restart_offset * 1000)
+                self.b4_restart_submitted = True
+                return
+        if self.next_sample is None or now >= self.next_sample:
+            self.worker.submit("sample")
+            self.next_sample = now + b4["metadataIntervalSeconds"]
+
+    def shutdown(self):
+        self.b4_stopping = True
+        failures = []
+        if self.worker is not None:
+            deadline = time.monotonic() + self.config["shutdownTimeoutSeconds"]
+            def wait_worker():
+                while self.worker.busy and time.monotonic() < deadline:
+                    try:
+                        self.step(0.05, stopping=True)
+                    except (CoordinationError, OSError, UnicodeError) as error:
+                        failures.append(str(error))
+                if self.worker.busy:
+                    raise CoordinationError("B4 worker cleanup deadline exceeded; manual broker inspection required")
+            try:
+                wait_worker()  # Never race a restart against an in-flight stop.
+                if self.worker.control.pending_restore:
+                    self.worker.submit("restore")
+                    wait_worker()
+                if self.worker.control.pending_restore:
+                    raise CoordinationError("B4 restoration unconfirmed; operator recovery required")
+                self.worker.close()
+                self.record("B4_WORKER_CLOSED", pendingRestoration=self.worker.control.pending_restore)
+            except (CoordinationError, OSError) as error:
+                failures.append(str(error))
+                if not self.worker.busy:
+                    try:
+                        self.worker.close()
+                    except CoordinationError as close_error:
+                        failures.append(str(close_error))
+                self.record("B4_OPERATOR_RECOVERY_REQUIRED", message=str(error))
+        failures.extend(self.b4_failures)
+        failures.extend(super().shutdown())
+        return failures
+
+
 def execute(config, processes_factory=Processes):
     config = validate(config)
     directory = config["outputDirectory"]
@@ -1118,7 +1752,8 @@ def execute(config, processes_factory=Processes):
             (directory / "errors.log").open("x", encoding="utf-8") as errors:
         processes = processes_factory(directory)
         try:
-            return Coordinator(config, processes, journal, errors).run()
+            coordinator_type = B4Coordinator if config["scenario"] == "B4" else Coordinator
+            return coordinator_type(config, processes, journal, errors).run()
         finally:
             processes.close()
 

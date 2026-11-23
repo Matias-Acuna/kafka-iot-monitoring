@@ -267,7 +267,7 @@ public final class MeasurementConsumerApplication {
         if (exception instanceof CsvFailureMarker) {
             return true;
         }
-        // D.6.14 has no dedicated exception type; verify its wrapper and origin.
+        // CSV write failures can be wrapped in IllegalStateException; verify their cause and origin.
         StackTraceElement[] origin = exception.getStackTrace();
         if (exception instanceof IllegalStateException && exception.getCause() instanceof IOException
                 && exception.getMessage() != null

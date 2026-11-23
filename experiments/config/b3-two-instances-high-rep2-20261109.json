@@ -1,0 +1,71 @@
+{
+  "runId": "fd8-b3-two-instances-high-rep2-20261109",
+  "scenario": "B3",
+  "outputDirectory": "experiments/results/fd8-b3-two-instances-high-rep2-20261109",
+  "commands": {
+    "consumer": [
+      "./scripts/run-measurement-consumer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--group-id",
+      "fd8-b3-two-instances-high-rep2-20261109-consumer",
+      "--auto-offset-reset",
+      "latest"
+    ],
+    "streams": [
+      "./scripts/run-kafka-streams-b3.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--application-id",
+      "fd8-b3-two-instances-high-rep2-20261109-streams",
+      "--rule",
+      "RAPID_CHANGE",
+      "--max-time-difference-ms",
+      "5000",
+      "--temperature-change-threshold",
+      "5.0",
+      "--cpu-quota",
+      "100%",
+      "--memory-max",
+      "2G",
+      "--state-dir",
+      "/tmp/kafka-iot-monitoring-b3/fd8-b3-two-instances-high-rep2-20261109/streams-1"
+    ],
+    "streams2": [
+      "./scripts/run-kafka-streams-b3.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--application-id",
+      "fd8-b3-two-instances-high-rep2-20261109-streams",
+      "--rule",
+      "RAPID_CHANGE",
+      "--max-time-difference-ms",
+      "5000",
+      "--temperature-change-threshold",
+      "5.0",
+      "--cpu-quota",
+      "100%",
+      "--memory-max",
+      "2G",
+      "--state-dir",
+      "/tmp/kafka-iot-monitoring-b3/fd8-b3-two-instances-high-rep2-20261109/streams-2"
+    ],
+    "producer": [
+      "./scripts/run-sensor-producer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--random-seed",
+      "456",
+      "--initial-event-timestamp",
+      "1700000000000",
+      "--timestamp-increment",
+      "1",
+      "--target-events-per-second",
+      "1000",
+      "--acks",
+      "all",
+      "--enable-idempotence",
+      "true"
+    ]
+  }
+}

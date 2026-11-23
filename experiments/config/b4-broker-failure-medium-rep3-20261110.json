@@ -1,0 +1,65 @@
+{
+  "runId": "fd8-b4-broker-failure-medium-rep3-20261110",
+  "scenario": "B4",
+  "outputDirectory": "experiments/results/fd8-b4-broker-failure-medium-rep3-20261110",
+  "commands": {
+    "consumer": [
+      "./scripts/run-measurement-consumer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--group-id",
+      "fd8-b4-broker-failure-medium-rep3-20261110-consumer",
+      "--auto-offset-reset",
+      "latest"
+    ],
+    "streams": [
+      "./scripts/run-kafka-streams.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--application-id",
+      "fd8-b4-broker-failure-medium-rep3-20261110-streams",
+      "--rule",
+      "RAPID_CHANGE",
+      "--max-time-difference-ms",
+      "5000",
+      "--temperature-change-threshold",
+      "5.0"
+    ],
+    "producer": [
+      "./scripts/run-sensor-producer.sh",
+      "--bootstrap-servers",
+      "localhost:29092,localhost:39092,localhost:49092",
+      "--random-seed",
+      "789",
+      "--initial-event-timestamp",
+      "1700000000000",
+      "--timestamp-increment",
+      "1",
+      "--target-events-per-second",
+      "100",
+      "--acks",
+      "all",
+      "--enable-idempotence",
+      "true"
+    ]
+  },
+  "shutdownTimeoutSeconds": 200,
+  "b4": {
+    "condition": "BROKER_FAILURE",
+    "composeProject": "infra",
+    "targetPartition": 0,
+    "warmUpSeconds": 60,
+    "preFailureSeconds": 120,
+    "interruptionSeconds": 60,
+    "generationSecondsAfterWarmUp": 480,
+    "observationSecondsAfterWarmUp": 480,
+    "drainSeconds": 120,
+    "metadataIntervalSeconds": 20,
+    "metadataMaxGapMs": 45000,
+    "metadataMaxAgeMs": 15000,
+    "commandTimeoutSeconds": 10,
+    "stopGraceSeconds": 5,
+    "restorationAttempts": 2,
+    "maxActionDelayMs": 15000
+  }
+}

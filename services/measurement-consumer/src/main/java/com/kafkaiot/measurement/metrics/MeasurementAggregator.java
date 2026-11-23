@@ -74,7 +74,7 @@ public final class MeasurementAggregator {
         return List.copyOf(receivedResults);
     }
 
-    /** Enable before consumption; no history scan or dashboard work in ordinary FD6 runs. */
+
     public synchronized void enableDashboard() {
         if (live != null) return;
         if (!receivedResults.isEmpty() || receivedAlertCount != 0) {

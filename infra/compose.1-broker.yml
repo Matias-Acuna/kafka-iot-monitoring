@@ -1,7 +1,7 @@
-# Reference: Apache Kafka 4.1.2, Docker Compose KRaft isolated plaintext example.
+# Based on the official Apache Kafka 4.1.2 Docker Compose example (KRaft, isolated controllers, PLAINTEXT).
 # https://github.com/apache/kafka/blob/4.1.2/docker/examples/docker-compose-files/cluster/isolated/plaintext/docker-compose.yml
-# One-broker experimental alternative; application topics are created separately.
-# Project-scoped containers, network and volumes isolate this deployment.
+# Single-broker configuration for B2 experiments; application topics are created separately.
+# Docker Compose project naming keeps this deployment's containers, network and volumes separate.
 name: kafka-iot-monitoring-1-broker
 x-common-environment: &common-environment
   CLUSTER_ID: 'aXw9Uc3FTwSs41-zRB27eg'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate B1-B3 scientific outputs after observation finalization.
+"""Generate B1-B4 scientific outputs after observation finalization.
 
 Usage: python3 scripts/generate-results.py --run-config PATH
 Reads the finalized run's recorded raw paths. summary.json is published last as
@@ -83,6 +83,8 @@ def generate(run_config):
                        "units": {"throughput": "events/s", "latency": "ms", "timestamps": "Unix epoch ms"},
                        "operationalCoverage": data["finalization"]["operationalCoverage"],
                        "throughput": throughput, "latency": latency, "reliability": reliability}
+            if data["scenario"] == "B4":
+                summary["b4"] = THROUGHPUT.b4_analysis(data, producers, results)
             with (stage / "summary.json").open("x", encoding="utf-8") as destination:
                 json.dump(summary, destination, indent=2, allow_nan=False)
                 destination.write("\n")
